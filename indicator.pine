@@ -1,0 +1,138 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © omardawoud77
+
+//@version=5
+indicator(title="NQ/SPX Futures Trend Indicator", shorttitle="NQ/SPX Trend", overlay=true)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+emaFastLen   = input.int(9,  title="EMA Fast Length",       group="EMA Settings")
+emaSlowLen   = input.int(21, title="EMA Slow Length",       group="EMA Settings")
+rsiLen       = input.int(14, title="RSI Length",            group="RSI Settings")
+rsiMidline   = input.int(50, title="RSI Midline",           group="RSI Settings")
+volLen       = input.int(20, title="Volume MA Length",      group="Volume Settings")
+showEmas     = input.bool(true, title="Show EMAs",          group="Display")
+showExit     = input.bool(true, title="Show Exit Signals",  group="Display")
+
+// ─────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────
+
+// EMAs
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+// Trend direction
+bullTrend = emaFast > emaSlow
+bearTrend = emaFast < emaSlow
+
+// EMA crossovers
+emaCrossUp   = ta.crossover(emaFast, emaSlow)
+emaCrossDown = ta.crossunder(emaFast, emaSlow)
+
+// RSI
+rsi = ta.rsi(close, rsiLen)
+rsiBull = rsi > rsiMidline
+rsiBear = rsi < rsiMidline
+
+// Volume confirmation
+volMA   = ta.sma(volume, volLen)
+volConf = volume > volMA
+
+// ─────────────────────────────────────────────
+// ENTRY CONDITIONS
+// ─────────────────────────────────────────────
+
+longEntry  = emaCrossUp   and rsiBull and volConf
+shortEntry = emaCrossDown and rsiBear and volConf
+
+// ─────────────────────────────────────────────
+// EXIT CONDITIONS
+// ─────────────────────────────────────────────
+
+// Exit long: EMA crosses back down OR RSI crosses below 50
+longExit  = emaCrossDown or ta.crossunder(rsi, rsiMidline)
+
+// Exit short: EMA crosses back up OR RSI crosses above 50
+shortExit = emaCrossUp   or ta.crossover(rsi, rsiMidline)
+
+// ─────────────────────────────────────────────
+// PLOTS — EMAs
+// ─────────────────────────────────────────────
+
+plot(showEmas ? emaFast : na, title="EMA 9",  color=color.new(color.aqua,   0), linewidth=1)
+plot(showEmas ? emaSlow : na, title="EMA 21", color=color.new(color.orange, 0), linewidth=1)
+
+// EMA fill to visualise trend zone
+emaFastPlot = plot(showEmas ? emaFast : na, display=display.none)
+emaSlowPlot = plot(showEmas ? emaSlow : na, display=display.none)
+fill(emaFastPlot, emaSlowPlot,
+     color = bullTrend
+         ? color.new(color.green, 88)
+         : color.new(color.red,   88),
+     title="EMA Cloud")
+
+// ─────────────────────────────────────────────
+// PLOTS — ENTRY SIGNALS
+// ─────────────────────────────────────────────
+
+plotshape(longEntry,
+     title    = "Long Entry",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.new(color.green, 0),
+     size     = size.normal,
+     text     = "LONG",
+     textcolor= color.new(color.green, 0))
+
+plotshape(shortEntry,
+     title    = "Short Entry",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.new(color.red, 0),
+     size     = size.normal,
+     text     = "SHORT",
+     textcolor= color.new(color.red, 0))
+
+// ─────────────────────────────────────────────
+// PLOTS — EXIT SIGNALS
+// ─────────────────────────────────────────────
+
+plotshape(showExit and longExit  and bullTrend[1],
+     title    = "Long Exit",
+     style    = shape.xcross,
+     location = location.abovebar,
+     color    = color.new(color.yellow, 0),
+     size     = size.small,
+     text     = "EXIT",
+     textcolor= color.new(color.yellow, 0))
+
+plotshape(showExit and shortExit and bearTrend[1],
+     title    = "Short Exit",
+     style    = shape.xcross,
+     location = location.belowbar,
+     color    = color.new(color.yellow, 0),
+     size     = size.small,
+     text     = "EXIT",
+     textcolor= color.new(color.yellow, 0))
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+
+alertcondition(longEntry,
+     title  = "Long Entry Signal",
+     message= "NQ/SPX Trend — LONG signal: EMA 9 crossed above EMA 21, RSI > 50, Volume confirmed.")
+
+alertcondition(shortEntry,
+     title  = "Short Entry Signal",
+     message= "NQ/SPX Trend — SHORT signal: EMA 9 crossed below EMA 21, RSI < 50, Volume confirmed.")
+
+alertcondition(longExit and bullTrend[1],
+     title  = "Long Exit Signal",
+     message= "NQ/SPX Trend — EXIT LONG: EMA crossed down or RSI dropped below 50.")
+
+alertcondition(shortExit and bearTrend[1],
+     title  = "Short Exit Signal",
+     message= "NQ/SPX Trend — EXIT SHORT: EMA crossed up or RSI crossed above 50.")
