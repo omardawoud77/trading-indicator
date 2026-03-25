@@ -1,8 +1,11 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0
-// © indicator
+// © strategy
 
 //@version=5
-indicator("FVG + IFVG Multi-Timeframe Strategy", overlay=true, max_boxes_count=200, max_lines_count=200, max_labels_count=100)
+strategy("NQ/SPX IFVG Strategy", overlay=true, initial_capital=100000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.5,
+     max_boxes_count=200, max_lines_count=200, max_labels_count=100)
 
 // ─────────────────────────────────────────────
 // INPUTS
@@ -232,11 +235,31 @@ long_signal  = long_confirm  and ema_bull and rsi_bull and vol_high
 short_signal = short_confirm and ema_bear and rsi_bear and vol_high
 
 // ─────────────────────────────────────────────
-// SL / TP LINES
+// SWING LEVELS
 // ─────────────────────────────────────────────
 swing_low  = ta.lowest(low,   swing_lb)
 swing_high = ta.highest(high, swing_lb)
 
+// ─────────────────────────────────────────────
+// STRATEGY ENTRIES & EXITS
+// ─────────────────────────────────────────────
+if long_signal
+    strategy.entry("Long", strategy.long)
+
+if short_signal
+    strategy.entry("Short", strategy.short)
+
+strategy.exit("Long Exit",  from_entry="Long",
+     stop  = swing_low,
+     limit = close + (close - swing_low))
+
+strategy.exit("Short Exit", from_entry="Short",
+     stop  = swing_high,
+     limit = close - (swing_high - close))
+
+// ─────────────────────────────────────────────
+// SL / TP LINES
+// ─────────────────────────────────────────────
 if long_signal
     sl_p = swing_low
     tp_p = close + (close - sl_p) * rr_ratio
@@ -323,3 +346,9 @@ f_row(0, 3, "Volume",   vol_high     ? "High"    : "Low",     vol_high)
 f_row(0, 4, "15m Bias", bias_15_bull ? "Bull"    : "Bear",    bias_15_bull)
 f_row(0, 5, "1H Bias",  bias_1h_bull ? "Bull"    : "Bear",    bias_1h_bull)
 f_row(0, 6, "HTF Bias", htf_bull     ? "Bullish" : "Bearish", htf_bull)
+
+// ─────────────────────────────────────────────
+// ALERT CONDITIONS
+// ─────────────────────────────────────────────
+alertcondition(long_signal,  title="Long Signal",  message="NQ/SPX IFVG — Long signal fired")
+alertcondition(short_signal, title="Short Signal", message="NQ/SPX IFVG — Short signal fired")
