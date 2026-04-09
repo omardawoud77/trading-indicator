@@ -291,7 +291,7 @@ def classify_regime(conditions, perception):  # REGIME FILTER
 def reason(ppo_action, conditions, perception, memory):
     evidence_for = []
     evidence_against = []
-    confidence = 0.50
+    confidence = 0.40  # GATE REDESIGN: was 0.50 — trades must earn their way in via boosts
 
     action_is_long = ppo_action == 1
     action_is_short = ppo_action == 2
@@ -308,10 +308,10 @@ def reason(ppo_action, conditions, perception, memory):
                 confidence += 0.07
             elif conditions['trend'] == 'MILD_BEAR':
                 evidence_against.append("Mild downtrend — long against trend")
-                confidence -= 0.10
+                confidence -= 0.05  # GATE REDESIGN: was 0.10
             elif conditions['trend'] == 'STRONG_BEAR':
                 evidence_against.append("Strong downtrend — long strongly against trend")
-                confidence -= 0.22
+                confidence -= 0.11  # GATE REDESIGN: was 0.22
 
         if action_is_short:
             if conditions['trend'] == 'STRONG_BEAR':
@@ -322,10 +322,10 @@ def reason(ppo_action, conditions, perception, memory):
                 confidence += 0.07
             elif conditions['trend'] == 'MILD_BULL':
                 evidence_against.append("Mild uptrend — short against trend")
-                confidence -= 0.10
+                confidence -= 0.05  # GATE REDESIGN: was 0.10
             elif conditions['trend'] == 'STRONG_BULL':
                 evidence_against.append("Strong uptrend — short strongly against trend")
-                confidence -= 0.22
+                confidence -= 0.11  # GATE REDESIGN: was 0.22
 
         # Momentum
         if action_is_long and conditions['momentum'] in ['STRONG_UP', 'WEAK_UP']:
@@ -333,14 +333,14 @@ def reason(ppo_action, conditions, perception, memory):
             confidence += 0.08
         elif action_is_long and conditions['momentum'] == 'STRONG_DOWN':
             evidence_against.append("Momentum strongly against long")
-            confidence -= 0.12
+            confidence -= 0.06  # GATE REDESIGN: was 0.12
 
         if action_is_short and conditions['momentum'] in ['STRONG_DOWN', 'WEAK_DOWN']:
             evidence_for.append("Momentum supports short")
             confidence += 0.08
         elif action_is_short and conditions['momentum'] == 'STRONG_UP':
             evidence_against.append("Momentum strongly against short")
-            confidence -= 0.12
+            confidence -= 0.06  # GATE REDESIGN: was 0.12
 
         # Volume
         if conditions['volume'] in ['HIGH', 'VERY_HIGH']:
@@ -348,7 +348,7 @@ def reason(ppo_action, conditions, perception, memory):
             confidence += 0.08
         elif conditions['volume'] == 'LOW':
             evidence_against.append("Low volume — weak conviction")
-            confidence -= 0.10
+            confidence -= 0.05  # GATE REDESIGN: was 0.10
 
         # Session — no boost or penalty; all sessions evaluated equally.
         # Session label is still part of conditions for memory bucket keys.
@@ -356,7 +356,7 @@ def reason(ppo_action, conditions, perception, memory):
         # Volatility
         if conditions['volatility'] == 'HIGH':
             evidence_against.append("High volatility — stop risk elevated")
-            confidence -= 0.08
+            confidence -= 0.04  # GATE REDESIGN: was 0.08
 
         # ICT: Wick confluence
         if action_is_long:
@@ -365,14 +365,14 @@ def reason(ppo_action, conditions, perception, memory):
                 confidence += 0.08
             elif conditions.get('wick') == 'UPPER_REJECTION':
                 evidence_against.append("Upper wick rejection contradicts long entry")
-                confidence -= 0.08
+                confidence -= 0.04  # GATE REDESIGN: was 0.08
         elif action_is_short:
             if conditions.get('wick') == 'UPPER_REJECTION':
                 evidence_for.append("Upper wick rejection confirms short entry")
                 confidence += 0.08
             elif conditions.get('wick') == 'LOWER_REJECTION':
                 evidence_against.append("Lower wick rejection contradicts short entry")
-                confidence -= 0.08
+                confidence -= 0.04  # GATE REDESIGN: was 0.08
 
         # ICT: Candle pattern confluence
         candle = conditions.get('candle', 'NORMAL')
@@ -381,17 +381,17 @@ def reason(ppo_action, conditions, perception, memory):
             confidence += 0.10
         elif action_is_long and candle == 'BEARISH_ENGULF':
             evidence_against.append("Bearish engulfing contradicts long")
-            confidence -= 0.10
+            confidence -= 0.05  # GATE REDESIGN: was 0.10
         elif action_is_short and candle == 'BEARISH_ENGULF':
             evidence_for.append("Bearish engulfing confirms short")
             confidence += 0.10
         elif action_is_short and candle == 'BULLISH_ENGULF':
             evidence_against.append("Bullish engulfing contradicts short")
-            confidence -= 0.10
+            confidence -= 0.05  # GATE REDESIGN: was 0.10
 
         if candle == 'DOJI':
             evidence_against.append("Doji — avoid entry during indecision")
-            confidence -= 0.12
+            confidence -= 0.06  # GATE REDESIGN: was 0.12
 
         # ICT: FVG confluence
         fvg = conditions.get('fvg', 'NONE')
@@ -407,14 +407,14 @@ def reason(ppo_action, conditions, perception, memory):
         if regime == 'TRENDING_BULL':  # REGIME FILTER  # REGIME TUNE
             if action_is_long:  # REGIME TUNE
                 evidence_against.append("Regime TRENDING_BULL — bot underperforms in trends (20.3% WR historically)")  # REGIME TUNE
-                confidence -= 0.05  # REGIME TUNE  # FREQUENCY TUNE
+                confidence -= 0.03  # GATE REDESIGN: was 0.05
             elif action_is_short:  # REGIME TUNE
                 evidence_for.append("Regime TRENDING_BULL — counter-trend short has edge here")  # REGIME TUNE
                 confidence += 0.05  # REGIME TUNE
         elif regime == 'TRENDING_BEAR':  # REGIME FILTER  # REGIME TUNE
             if action_is_short:  # REGIME TUNE
                 evidence_against.append("Regime TRENDING_BEAR — bot underperforms in trends (17.1% WR historically)")  # REGIME TUNE
-                confidence -= 0.05  # REGIME TUNE  # FREQUENCY TUNE
+                confidence -= 0.03  # GATE REDESIGN: was 0.05
             elif action_is_long:  # REGIME TUNE
                 evidence_for.append("Regime TRENDING_BEAR — counter-trend long has edge here")  # REGIME TUNE
                 confidence += 0.05  # REGIME TUNE
@@ -423,10 +423,10 @@ def reason(ppo_action, conditions, perception, memory):
             confidence += 0.08  # REGIME TUNE
         elif regime == 'HIGH_VOLATILITY':  # REGIME FILTER
             evidence_against.append("Regime HIGH_VOLATILITY — elevated stop risk")  # REGIME FILTER
-            confidence -= 0.10  # REGIME FILTER
+            confidence -= 0.05  # GATE REDESIGN: was 0.10
         elif regime == 'LOW_QUALITY':  # REGIME FILTER  # REGIME TUNE
             evidence_against.append("Regime LOW_QUALITY — conflicting signals, no clear setup")  # REGIME TUNE
-            confidence -= 0.10  # REGIME TUNE  # FREQUENCY TUNE
+            confidence -= 0.05  # GATE REDESIGN: was 0.10
 
         # Memory check
         veto, wr = memory.should_veto(conditions)
@@ -434,7 +434,7 @@ def reason(ppo_action, conditions, perception, memory):
             evidence_against.append(
                 f"MEMORY VETO: this setup has only {wr:.0%} WR historically"
             )
-            confidence -= 0.30
+            confidence -= 0.15  # GATE REDESIGN: was 0.30
 
         else:
             adj = memory.confidence_adjustment(conditions)
