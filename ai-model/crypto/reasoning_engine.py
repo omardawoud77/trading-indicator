@@ -564,6 +564,46 @@ def get_dynamic_sl_tp(conditions, memory):
         return 0.025, 0.05
 
 
+# ── LAYER 3.75: SETUP QUALITY TIERS ──────────────────────────────────────────
+# QUALITY TIER
+
+def classify_setup_quality(conditions, confidence, memory, perception):  # QUALITY TIER
+    """Classify trade into A+/A/B/TRASH quality tiers."""  # QUALITY TIER
+    regime = conditions.get('regime', 'LOW_QUALITY')  # QUALITY TIER
+    volume = conditions.get('volume', 'NORMAL')  # QUALITY TIER
+    momentum = conditions.get('momentum', 'WEAK_UP')  # QUALITY TIER
+    atr_pct = perception.get('atr_pct', 0.02)  # QUALITY TIER
+    expectancy = memory.get_expectancy(conditions)  # QUALITY TIER
+
+    # TRASH tier — block immediately  # QUALITY TIER
+    if confidence < 0.50:  # QUALITY TIER
+        return 'TRASH'  # QUALITY TIER
+    if regime == 'HIGH_VOLATILITY' and atr_pct > 0.03:  # QUALITY TIER
+        return 'TRASH'  # QUALITY TIER
+    if expectancy is not None and expectancy < -0.3:  # QUALITY TIER
+        return 'TRASH'  # QUALITY TIER
+
+    # A+ tier — best setups  # QUALITY TIER
+    regime_ok = regime in ('RANGING', 'TRENDING_BULL', 'TRENDING_BEAR')  # QUALITY TIER
+    volume_ok = volume in ('HIGH', 'VERY_HIGH')  # QUALITY TIER
+    momentum_ok = momentum in ('STRONG_UP', 'STRONG_DOWN', 'WEAK_UP', 'WEAK_DOWN')  # QUALITY TIER
+    expectancy_ok = expectancy is None or expectancy >= 0.2  # QUALITY TIER
+    if regime_ok and volume_ok and momentum_ok and expectancy_ok and confidence >= 0.68:  # QUALITY TIER
+        return 'A_PLUS'  # QUALITY TIER
+
+    # A tier — good setups  # QUALITY TIER
+    regime_not_bad = regime not in ('HIGH_VOLATILITY', 'LOW_QUALITY')  # QUALITY TIER
+    volume_not_low = volume != 'LOW'  # QUALITY TIER
+    if regime_not_bad and volume_not_low and confidence >= 0.58:  # QUALITY TIER
+        return 'A'  # QUALITY TIER
+
+    # B tier — marginal  # QUALITY TIER
+    if confidence >= 0.50 and regime != 'HIGH_VOLATILITY':  # QUALITY TIER
+        return 'B'  # QUALITY TIER
+
+    return 'TRASH'  # QUALITY TIER
+
+
 # ── LAYER 4: DECISION + EXPLANATION ──────────────────────────────────────────
 
 def decide(ppo_action, conditions, perception, memory, narrative):
@@ -590,12 +630,16 @@ def decide(ppo_action, conditions, perception, memory, narrative):
         for e in evidence_against:
             lines.append(f"  ❌ {e}")
 
+    # QUALITY TIER: classify setup quality
+    tier = classify_setup_quality(conditions, confidence, memory, perception)  # QUALITY TIER
+
     expectancy = memory.get_expectancy(conditions)  # EXPECTANCY
     if expectancy is not None:  # EXPECTANCY
         lines.append(f"Expectancy: {expectancy:+.2f}R per trade")  # EXPECTANCY
     lines.append(f"Confidence: {confidence:.0%}")
+    lines.append(f"Quality: {tier}")  # QUALITY TIER
     lines.append(f"Verdict: {verdict}")
 
     reasoning_text = "\n".join(lines)
 
-    return verdict, confidence, reasoning_text
+    return verdict, confidence, reasoning_text, tier  # QUALITY TIER: added tier

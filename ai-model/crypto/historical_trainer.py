@@ -204,7 +204,7 @@ def train(df, model, memory):
 
         # Get reasoning verdict
         try:
-            verdict, confidence, reasoning_text = decide(
+            verdict, confidence, reasoning_text, tier = decide(  # QUALITY TIER: unpack tier
                 action, conditions, perception, memory, narrative
             )
         except Exception:

@@ -720,7 +720,7 @@ def process_symbol(symbol, ctx):
         # ── Reasoning gate ───────────────────────────────────────────────────
         perception = perceive(df, state)
         conditions, narrative = interpret(perception)
-        verdict, confidence, reasoning_text = decide(action, conditions, perception, memory, narrative)
+        verdict, confidence, reasoning_text, tier = decide(action, conditions, perception, memory, narrative)  # QUALITY TIER: unpack tier
         log.info(f"\n{'='*55}\n{tag} {reasoning_text}\n{'='*55}")
 
         if action in (1, 2) and verdict not in ("EXECUTE", "WEAK_EXECUTE"):
@@ -779,11 +779,24 @@ def process_symbol(symbol, ctx):
                     log.warning(f"{tag} Risk-sized notional ${trade_notional:.2f} too small "
                                 f"for min_qty={min_qty} — skipping entry")
                     return
+                # QUALITY TIER: apply tier-based position sizing
+                tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'TRASH': 0.0}  # QUALITY TIER
+                tier_mult = tier_multipliers.get(tier, 0.0)  # QUALITY TIER
+                if tier == 'TRASH':  # QUALITY TIER
+                    log.warning(f"{tag} ⛔ TRASH tier — skipping entry")  # QUALITY TIER
+                    return  # QUALITY TIER
+                trade_notional = trade_notional * tier_mult  # QUALITY TIER
+                # Floor check again after tier scaling  # QUALITY TIER
+                if trade_notional / max(current_price, 1) < min_qty:  # QUALITY TIER
+                    log.warning(f"{tag} Tier-scaled notional ${trade_notional:.2f} too small "  # QUALITY TIER
+                                f"for min_qty={min_qty} — skipping entry")  # QUALITY TIER
+                    return  # QUALITY TIER
                 log.info(f"{tag} 📐 Risk sizing: balance=${pre_trade_balance:,.2f} | "
                          f"1% risk=${risk_per_trade:.2f} | SL={sl_pct:.1%} | "
                          f"raw_notional=${risk_notional:,.2f} | "
                          f"capped=${trade_notional:,.2f} | TP={tp_pct:.1%} | "
-                         f"WR={memory.get_win_rate(conditions)}")
+                         f"WR={memory.get_win_rate(conditions)} | "
+                         f"Tier={tier} ({tier_mult:.0%})")  # QUALITY TIER
 
             if action == 1:  # LONG
                 order, qty = open_long(exec_client, symbol, trade_notional, current_price,
