@@ -404,29 +404,29 @@ def reason(ppo_action, conditions, perception, memory):
 
         # Market regime filter  # REGIME FILTER
         regime = conditions.get('regime', 'LOW_QUALITY')  # REGIME FILTER
-        if regime == 'TRENDING_BULL':  # REGIME FILTER
-            if action_is_long:  # REGIME FILTER
-                evidence_for.append(f"Regime TRENDING_BULL supports long")  # REGIME FILTER
-                confidence += 0.08  # REGIME FILTER
-            elif action_is_short:  # REGIME FILTER
-                evidence_against.append(f"Regime TRENDING_BULL opposes short")  # REGIME FILTER
-                confidence -= 0.12  # REGIME FILTER
-        elif regime == 'TRENDING_BEAR':  # REGIME FILTER
-            if action_is_short:  # REGIME FILTER
-                evidence_for.append(f"Regime TRENDING_BEAR supports short")  # REGIME FILTER
-                confidence += 0.08  # REGIME FILTER
-            elif action_is_long:  # REGIME FILTER
-                evidence_against.append(f"Regime TRENDING_BEAR opposes long")  # REGIME FILTER
-                confidence -= 0.12  # REGIME FILTER
-        elif regime == 'RANGING':  # REGIME FILTER
-            evidence_against.append(f"Regime RANGING — low edge for directional trades")  # REGIME FILTER
-            confidence -= 0.08  # REGIME FILTER
+        if regime == 'TRENDING_BULL':  # REGIME FILTER  # REGIME TUNE
+            if action_is_long:  # REGIME TUNE
+                evidence_against.append("Regime TRENDING_BULL — bot underperforms in trends (20.3% WR historically)")  # REGIME TUNE
+                confidence -= 0.08  # REGIME TUNE
+            elif action_is_short:  # REGIME TUNE
+                evidence_for.append("Regime TRENDING_BULL — counter-trend short has edge here")  # REGIME TUNE
+                confidence += 0.05  # REGIME TUNE
+        elif regime == 'TRENDING_BEAR':  # REGIME FILTER  # REGIME TUNE
+            if action_is_short:  # REGIME TUNE
+                evidence_against.append("Regime TRENDING_BEAR — bot underperforms in trends (17.1% WR historically)")  # REGIME TUNE
+                confidence -= 0.08  # REGIME TUNE
+            elif action_is_long:  # REGIME TUNE
+                evidence_for.append("Regime TRENDING_BEAR — counter-trend long has edge here")  # REGIME TUNE
+                confidence += 0.05  # REGIME TUNE
+        elif regime == 'RANGING':  # REGIME FILTER  # REGIME TUNE
+            evidence_for.append("Regime RANGING — bot has edge in range conditions (48.8% WR historically)")  # REGIME TUNE
+            confidence += 0.08  # REGIME TUNE
         elif regime == 'HIGH_VOLATILITY':  # REGIME FILTER
-            evidence_against.append(f"Regime HIGH_VOLATILITY — elevated stop risk")  # REGIME FILTER
+            evidence_against.append("Regime HIGH_VOLATILITY — elevated stop risk")  # REGIME FILTER
             confidence -= 0.10  # REGIME FILTER
-        elif regime == 'LOW_QUALITY':  # REGIME FILTER
-            evidence_against.append(f"Regime LOW_QUALITY — conflicting signals, no clear setup")  # REGIME FILTER
-            confidence -= 0.20  # REGIME FILTER
+        elif regime == 'LOW_QUALITY':  # REGIME FILTER  # REGIME TUNE
+            evidence_against.append("Regime LOW_QUALITY — conflicting signals, no clear setup")  # REGIME TUNE
+            confidence -= 0.15  # REGIME TUNE
 
         # Memory check
         veto, wr = memory.should_veto(conditions)
@@ -540,15 +540,15 @@ def simulate_missed_trade(df, rejection_bar_idx, rejected_action, sl_pct, tp_pct
 def get_dynamic_sl_tp(conditions, memory):
     wr = memory.get_win_rate(conditions)
     if wr is None:
-        return 0.015, 0.04
-    if wr >= 0.70:
-        return 0.015, 0.045
-    elif wr >= 0.60:
-        return 0.015, 0.04
-    elif wr >= 0.55:
-        return 0.025, 0.035
-    else:
-        return 0.015, 0.04
+        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R) — default for unknown setups
+    if wr >= 0.60:  # SL TUNE
+        return 0.020, 0.05  # SL TUNE: 2% SL, 5% TP (2.5R) — reward high WR with tighter SL
+    elif wr >= 0.55:  # SL TUNE
+        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R)
+    elif wr >= 0.50:  # SL TUNE
+        return 0.025, 0.06  # SL TUNE: 2.5% SL, 6% TP (2.4R) — RANGING regime often hits this
+    else:  # SL TUNE
+        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R) — minimum acceptable
 
 
 # ── LAYER 4: DECISION + EXPLANATION ──────────────────────────────────────────
