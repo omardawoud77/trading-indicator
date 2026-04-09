@@ -407,14 +407,14 @@ def reason(ppo_action, conditions, perception, memory):
         if regime == 'TRENDING_BULL':  # REGIME FILTER  # REGIME TUNE
             if action_is_long:  # REGIME TUNE
                 evidence_against.append("Regime TRENDING_BULL — bot underperforms in trends (20.3% WR historically)")  # REGIME TUNE
-                confidence -= 0.08  # REGIME TUNE
+                confidence -= 0.05  # REGIME TUNE  # FREQUENCY TUNE
             elif action_is_short:  # REGIME TUNE
                 evidence_for.append("Regime TRENDING_BULL — counter-trend short has edge here")  # REGIME TUNE
                 confidence += 0.05  # REGIME TUNE
         elif regime == 'TRENDING_BEAR':  # REGIME FILTER  # REGIME TUNE
             if action_is_short:  # REGIME TUNE
                 evidence_against.append("Regime TRENDING_BEAR — bot underperforms in trends (17.1% WR historically)")  # REGIME TUNE
-                confidence -= 0.08  # REGIME TUNE
+                confidence -= 0.05  # REGIME TUNE  # FREQUENCY TUNE
             elif action_is_long:  # REGIME TUNE
                 evidence_for.append("Regime TRENDING_BEAR — counter-trend long has edge here")  # REGIME TUNE
                 confidence += 0.05  # REGIME TUNE
@@ -426,7 +426,7 @@ def reason(ppo_action, conditions, perception, memory):
             confidence -= 0.10  # REGIME FILTER
         elif regime == 'LOW_QUALITY':  # REGIME FILTER  # REGIME TUNE
             evidence_against.append("Regime LOW_QUALITY — conflicting signals, no clear setup")  # REGIME TUNE
-            confidence -= 0.15  # REGIME TUNE
+            confidence -= 0.10  # REGIME TUNE  # FREQUENCY TUNE
 
         # Memory check
         veto, wr = memory.should_veto(conditions)
@@ -477,9 +477,9 @@ def reason(ppo_action, conditions, perception, memory):
 
     # Verdict
     if ppo_action in (1, 2):
-        if confidence >= 0.72:
+        if confidence >= 0.68:  # FREQUENCY TUNE: was 0.72
             verdict = "EXECUTE"
-        elif confidence >= 0.62:
+        elif confidence >= 0.58:  # FREQUENCY TUNE: was 0.62
             verdict = "WEAK_EXECUTE"
         else:
             verdict = "REJECT"
