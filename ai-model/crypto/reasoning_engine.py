@@ -538,17 +538,30 @@ def simulate_missed_trade(df, rejection_bar_idx, rejected_action, sl_pct, tp_pct
 # ── LAYER 3.5: DYNAMIC RISK SIZING ───────────────────────────────────────────
 
 def get_dynamic_sl_tp(conditions, memory):
+    # EXPECTANCY: try expectancy-based sizing first
+    expectancy = memory.get_expectancy(conditions)  # EXPECTANCY
+    if expectancy is not None:  # EXPECTANCY
+        if expectancy >= 0.5:  # EXPECTANCY: strong positive expectancy
+            return 0.020, 0.05  # EXPECTANCY: tighter SL, reward high-E setups
+        elif expectancy >= 0.1:  # EXPECTANCY: positive expectancy
+            return 0.025, 0.05  # EXPECTANCY: standard 2R
+        elif expectancy >= 0.0:  # EXPECTANCY: breakeven
+            return 0.025, 0.06  # EXPECTANCY: wider TP to improve expectancy
+        else:  # EXPECTANCY: negative expectancy
+            return 0.030, 0.05  # EXPECTANCY: wider SL to reduce false stops
+
+    # Fallback to WR-based if no expectancy data  # EXPECTANCY
     wr = memory.get_win_rate(conditions)
     if wr is None:
-        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R) — default for unknown setups
-    if wr >= 0.60:  # SL TUNE
-        return 0.020, 0.05  # SL TUNE: 2% SL, 5% TP (2.5R) — reward high WR with tighter SL
-    elif wr >= 0.55:  # SL TUNE
-        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R)
-    elif wr >= 0.50:  # SL TUNE
-        return 0.025, 0.06  # SL TUNE: 2.5% SL, 6% TP (2.4R) — RANGING regime often hits this
-    else:  # SL TUNE
-        return 0.025, 0.05  # SL TUNE: 2.5% SL, 5% TP (2R) — minimum acceptable
+        return 0.025, 0.05
+    if wr >= 0.60:
+        return 0.020, 0.05
+    elif wr >= 0.55:
+        return 0.025, 0.05
+    elif wr >= 0.50:
+        return 0.025, 0.06
+    else:
+        return 0.025, 0.05
 
 
 # ── LAYER 4: DECISION + EXPLANATION ──────────────────────────────────────────
@@ -577,6 +590,9 @@ def decide(ppo_action, conditions, perception, memory, narrative):
         for e in evidence_against:
             lines.append(f"  ❌ {e}")
 
+    expectancy = memory.get_expectancy(conditions)  # EXPECTANCY
+    if expectancy is not None:  # EXPECTANCY
+        lines.append(f"Expectancy: {expectancy:+.2f}R per trade")  # EXPECTANCY
     lines.append(f"Confidence: {confidence:.0%}")
     lines.append(f"Verdict: {verdict}")
 

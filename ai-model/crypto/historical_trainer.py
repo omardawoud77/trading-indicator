@@ -270,7 +270,8 @@ def train(df, model, memory):
             confidence=confidence,
             verdict=verdict,
             reasoning=reasoning_text[:200],
-            trade_type="historical"
+            trade_type="historical",
+            sl_pct=SL_PCT,  # EXPECTANCY: pass SL for R-multiple calculation
         )
 
         trades_recorded += 1
