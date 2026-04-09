@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from stable_baselines3 import PPO
-from crypto_env_v2 import CryptoMTFEnv
+from crypto_env_v2 import CryptoMTFEnv, CryptoTechEnv  # NEW_MODEL: import 44-feature env
 from reasoning_engine import perceive, interpret, decide, get_dynamic_sl_tp, simulate_missed_trade
 from trade_memory import TradeMemory
 
@@ -41,7 +41,7 @@ MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
 MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
 RISK_PER_TRADE_PCT = 0.01       # risk 1% of balance per trade
 KILL_SWITCH_DRAWDOWN_PCT = 0.05  # SAFETY FIX: 5% drawdown from starting balance kills all trading
-MODEL_PATH      = "crypto_mtf_best.zip"
+MODEL_PATH      = "crypto_mtf_tech_best.zip"  # NEW_MODEL: 44-feature tech model
 LOG_PATH        = "crypto_live_agent.log"
 LEGACY_BTC_STATE = "crypto_live_state.json"  # pre-multisymbol path, migrated on first load
 MIN_BARS        = 50
@@ -688,7 +688,7 @@ def process_symbol(symbol, ctx):
             log.error(f"{tag} ❌ Position reconcile failed: {e}")
 
         # ── Build observation ────────────────────────────────────────────────
-        env = CryptoMTFEnv(df.iloc[:-1].reset_index(drop=True))
+        env = CryptoTechEnv(df.iloc[:-1].reset_index(drop=True))  # NEW_MODEL: 44-feature env
         env.reset()
         obs = env._get_obs(len(df) - 2)
 
