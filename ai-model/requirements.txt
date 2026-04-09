@@ -1,7 +1,8 @@
-pandas
-numpy
-scikit-learn
-xgboost
-matplotlib
-seaborn
-joblib
+--extra-index-url https://download.pytorch.org/whl/cpu
+python-binance==1.0.19
+stable-baselines3==2.3.2
+gymnasium==0.29.1
+shimmy>=0.2.1
+pandas>=1.5.0
+numpy>=1.21.0
+torch>=2.0.0
