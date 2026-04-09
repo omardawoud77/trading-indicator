@@ -437,6 +437,7 @@ def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
             type="STOP_MARKET",
             stopPrice=sl_price,
             closePosition="true",
+            workingType="CONTRACT_PRICE",  # SL_FIX: use contract price, not mark price
         )
         log.info(f"{tag} SL confirmed — orderId: {sl_order['orderId']} @ ${sl_price}")
         return True
