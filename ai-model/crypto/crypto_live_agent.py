@@ -38,6 +38,8 @@ LEVERAGE        = 3              # 3× leverage
 FETCH_EVERY     = 300            # seconds between cycles (5 min)
 MAX_DAILY_TRADES = 6             # max NEW entries per UTC day PER SYMBOL (18 total across 3)
 MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
+MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
+RISK_PER_TRADE_PCT = 0.01       # risk 1% of balance per trade
 MODEL_PATH      = "crypto_mtf_best.zip"
 LOG_PATH        = "crypto_live_agent.log"
 LEGACY_BTC_STATE = "crypto_live_state.json"  # pre-multisymbol path, migrated on first load
@@ -98,6 +100,7 @@ DEFAULT_STATE = {
     "breakeven_set": False,
     "trail_1r_set": False,
     "consecutive_losses": 0,
+    "last_trade_id": None,
 }
 
 def load_state(state_path):
@@ -252,6 +255,48 @@ def close_long(client, symbol, qty):
 
 def close_short(client, symbol, qty):
     return place_futures_order(client, symbol, "BUY", qty, reduce_only=True)
+
+
+def confirm_order_fill(client, symbol, order, tag=""):
+    """Query order status to confirm fill. Returns (filled, avg_price, exec_qty) or
+    (False, 0, 0) if not filled. Retries up to 3 times with short waits."""
+    order_id = order.get('orderId')
+    if not order_id:
+        log.critical(f"{tag} No orderId in order response — cannot confirm fill")
+        return False, 0.0, 0.0
+
+    for attempt in range(3):
+        try:
+            info = client.futures_get_order(symbol=symbol, orderId=order_id)
+            status = info.get('status', '')
+            exec_qty = float(info.get('executedQty', 0))
+            # avgPrice is the VWAP of the fill
+            avg_price = float(info.get('avgPrice', 0))
+
+            if status == 'FILLED':
+                log.info(f"{tag} Order {order_id} FILLED | avgPrice=${avg_price:,.2f} | qty={exec_qty}")
+                return True, avg_price, exec_qty
+            elif status == 'PARTIALLY_FILLED':
+                log.warning(f"{tag} Order {order_id} PARTIALLY_FILLED | "
+                            f"avgPrice=${avg_price:,.2f} | execQty={exec_qty}")
+                return True, avg_price, exec_qty
+            elif status in ('NEW', 'PENDING_NEW'):
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                log.critical(f"{tag} Order {order_id} still {status} after 3 checks — treating as unfilled")
+                return False, 0.0, 0.0
+            else:
+                # CANCELED, REJECTED, EXPIRED, etc.
+                log.critical(f"{tag} Order {order_id} status={status} — NOT filled")
+                return False, 0.0, 0.0
+        except Exception as e:
+            log.error(f"{tag} confirm_order_fill attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(1)
+
+    log.critical(f"{tag} Could not confirm order {order_id} after 3 attempts")
+    return False, 0.0, 0.0
 
 
 def emergency_close_position(client, symbol, position, qty, tag=""):
@@ -480,26 +525,59 @@ def process_symbol(symbol, ctx):
         # ── Execute ──────────────────────────────────────────────────────────
         if state['position'] == 0 and entries_allowed:
             if action in (1, 2):
+                # ── Idempotency: duplicate order protection ──────────────
+                bar_ts_str = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
+                trade_id = f"{symbol}_{bar_ts_str}"
+                if trade_id == state.get('last_trade_id'):
+                    log.warning(f"{tag} Duplicate signal on same bar — trade_id={trade_id} — skipping")
+                    return
+
+                # ── Global exposure limit ────────────────────────────────
+                open_count = sum(1 for s in SYMBOLS if ctx['states'][s]['position'] != 0)
+                if open_count >= MAX_CONCURRENT_POSITIONS:
+                    log.warning(f"{tag} Exposure limit: {open_count}/{MAX_CONCURRENT_POSITIONS} "
+                                f"positions open — blocking new entry")
+                    return
+
                 sl_pct, tp_pct = get_dynamic_sl_tp(conditions, memory)
 
-                # Fetch real balance before every entry — use for position sizing
+                # ── Risk-based position sizing ───────────────────────────
                 pre_trade_balance = fetch_live_balance(exec_client)
                 if pre_trade_balance <= 0:
                     log.error(f"{tag} Balance fetch returned ${pre_trade_balance:.2f} — aborting entry")
                     return
-                trade_notional = min(TRADE_NOTIONAL, pre_trade_balance * LEVERAGE * 0.30)
-                log.info(f"{tag} 📐 Dynamic SL: {sl_pct:.1%} | TP: {tp_pct:.1%} | "
-                         f"WR basis: {memory.get_win_rate(conditions)} | "
-                         f"Balance: ${pre_trade_balance:,.2f} | Notional: ${trade_notional:,.2f}")
+                risk_per_trade = pre_trade_balance * RISK_PER_TRADE_PCT
+                risk_notional = risk_per_trade / max(sl_pct, 0.001)
+                trade_notional = min(risk_notional, TRADE_NOTIONAL,
+                                     pre_trade_balance * LEVERAGE * 0.30)
+                # Floor check: enough to buy min_qty?
+                if trade_notional / max(current_price, 1) < min_qty:
+                    log.warning(f"{tag} Risk-sized notional ${trade_notional:.2f} too small "
+                                f"for min_qty={min_qty} — skipping entry")
+                    return
+                log.info(f"{tag} 📐 Risk sizing: balance=${pre_trade_balance:,.2f} | "
+                         f"1% risk=${risk_per_trade:.2f} | SL={sl_pct:.1%} | "
+                         f"raw_notional=${risk_notional:,.2f} | "
+                         f"capped=${trade_notional:,.2f} | TP={tp_pct:.1%} | "
+                         f"WR={memory.get_win_rate(conditions)}")
 
             if action == 1:  # LONG
                 order, qty = open_long(exec_client, symbol, trade_notional, current_price,
                                        step_size, min_qty, qty_prec)
                 if order:
+                    # ── Confirm fill before updating state ───────────────
+                    filled, avg_price, exec_qty = confirm_order_fill(
+                        exec_client, symbol, order, tag)
+                    if not filled:
+                        log.critical(f"{tag} LONG order NOT confirmed filled — state NOT updated")
+                        return
+                    actual_qty = exec_qty if exec_qty > 0 else qty
+                    actual_price = avg_price if avg_price > 0 else current_price
+
                     state['position'] = 1
-                    state['entry_price'] = current_price
+                    state['entry_price'] = actual_price
                     state['entry_time'] = datetime.now(timezone.utc).isoformat()
-                    state['qty'] = qty
+                    state['qty'] = actual_qty
                     state['trade_count'] += 1
                     state['daily_trades'] += 1
                     state['sl_pct'] = sl_pct
@@ -508,12 +586,13 @@ def process_symbol(symbol, ctx):
                     state['entry_confidence'] = confidence
                     state['entry_verdict'] = verdict
                     state['entry_reasoning'] = reasoning_text[:300]
+                    state['last_trade_id'] = trade_id
                     save_state(state, state_path)
-                    log.info(f"{tag} 📈 LONG opened | qty={qty} @ ${current_price:,.2f}")
-                    sl_price = round_price(current_price * (1 - sl_pct), tick_size, price_prec)
+                    log.info(f"{tag} 📈 LONG opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
+                    sl_price = round_price(actual_price * (1 - sl_pct), tick_size, price_prec)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "SELL", sl_price,
-                        state['position'], qty, disabled_symbols, tag)
+                        state['position'], actual_qty, disabled_symbols, tag)
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
@@ -526,10 +605,19 @@ def process_symbol(symbol, ctx):
                 order, qty = open_short(exec_client, symbol, trade_notional, current_price,
                                         step_size, min_qty, qty_prec)
                 if order:
+                    # ── Confirm fill before updating state ───────────────
+                    filled, avg_price, exec_qty = confirm_order_fill(
+                        exec_client, symbol, order, tag)
+                    if not filled:
+                        log.critical(f"{tag} SHORT order NOT confirmed filled — state NOT updated")
+                        return
+                    actual_qty = exec_qty if exec_qty > 0 else qty
+                    actual_price = avg_price if avg_price > 0 else current_price
+
                     state['position'] = -1
-                    state['entry_price'] = current_price
+                    state['entry_price'] = actual_price
                     state['entry_time'] = datetime.now(timezone.utc).isoformat()
-                    state['qty'] = qty
+                    state['qty'] = actual_qty
                     state['trade_count'] += 1
                     state['daily_trades'] += 1
                     state['sl_pct'] = sl_pct
@@ -538,12 +626,13 @@ def process_symbol(symbol, ctx):
                     state['entry_confidence'] = confidence
                     state['entry_verdict'] = verdict
                     state['entry_reasoning'] = reasoning_text[:300]
+                    state['last_trade_id'] = trade_id
                     save_state(state, state_path)
-                    log.info(f"{tag} 📉 SHORT opened | qty={qty} @ ${current_price:,.2f}")
-                    sl_price = round_price(current_price * (1 + sl_pct), tick_size, price_prec)
+                    log.info(f"{tag} 📉 SHORT opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
+                    sl_price = round_price(actual_price * (1 + sl_pct), tick_size, price_prec)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "BUY", sl_price,
-                        state['position'], qty, disabled_symbols, tag)
+                        state['position'], actual_qty, disabled_symbols, tag)
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
