@@ -40,6 +40,7 @@ MAX_DAILY_TRADES = 6             # max NEW entries per UTC day PER SYMBOL (18 to
 MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
 MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
 RISK_PER_TRADE_PCT = 0.01       # risk 1% of balance per trade
+KILL_SWITCH_DRAWDOWN_PCT = 0.05  # SAFETY FIX: 5% drawdown from starting balance kills all trading
 MODEL_PATH      = "crypto_mtf_best.zip"
 LOG_PATH        = "crypto_live_agent.log"
 LEGACY_BTC_STATE = "crypto_live_state.json"  # pre-multisymbol path, migrated on first load
@@ -48,6 +49,7 @@ MIN_BARS        = 50
 FUTURES_TESTNET_URL = "https://testnet.binancefuture.com/fapi"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DISABLED_SYMBOLS_PATH = os.path.join(HERE, "disabled_symbols.json")  # SAFETY FIX: persist across restarts
 
 def state_path_for(symbol):
     return os.path.join(HERE, f"state_{symbol.lower()}.json")
@@ -134,12 +136,17 @@ DEFAULT_STATE = {
 }
 
 def load_state(state_path):
+    # SAFETY FIX: wrap json.load in try/except — never crash on corrupted state
     if os.path.exists(state_path):
-        with open(state_path) as f:
-            loaded = json.load(f)
-        for k, v in DEFAULT_STATE.items():
-            loaded.setdefault(k, v)
-        return loaded
+        try:
+            with open(state_path) as f:
+                loaded = json.load(f)
+            for k, v in DEFAULT_STATE.items():
+                loaded.setdefault(k, v)
+            return loaded
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+            log.warning(f"⚠️  Corrupted state file {state_path}: {e} — using defaults")
+            return dict(DEFAULT_STATE)
     return dict(DEFAULT_STATE)
 
 def save_state(state, state_path):
@@ -171,16 +178,21 @@ def load_state_with_migration(symbol):
         legacy = os.path.join(HERE, LEGACY_BTC_STATE)
         if os.path.exists(legacy):
             log.info(f"📦 Migrating BTC state from {LEGACY_BTC_STATE} → state_btcusdt.json")
-            with open(legacy) as f:
-                loaded = json.load(f)
-            for k, v in DEFAULT_STATE.items():
-                loaded.setdefault(k, v)
-            save_state(loaded, new_path)
-            # Leave legacy file in place for rollback safety
-            return loaded
+            # SAFETY FIX: wrap legacy json.load in try/except
+            try:
+                with open(legacy) as f:
+                    loaded = json.load(f)
+                for k, v in DEFAULT_STATE.items():
+                    loaded.setdefault(k, v)
+                save_state(loaded, new_path)
+                return loaded
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                log.warning(f"⚠️  Corrupted legacy state {legacy}: {e} — using defaults")
+                return dict(DEFAULT_STATE)
 
     return dict(DEFAULT_STATE)
 
+# SAFETY FIX: return None on failure — never return a fake balance
 def fetch_live_balance(client):
     try:
         bal = client.futures_account_balance()
@@ -188,7 +200,54 @@ def fetch_live_balance(client):
         return usdt
     except Exception as e:
         log.error(f"❌ Could not fetch balance: {e}")
-        return 1000.0
+        return None  # SAFETY FIX: callers must handle None explicitly
+
+
+# ── Disabled symbols persistence ─────────────────────────────────────────────
+# SAFETY FIX: disabled symbols survive restarts — cannot re-enable by restarting
+
+def load_disabled_symbols():
+    """Load disabled symbols from disk. Returns a set."""
+    if os.path.exists(DISABLED_SYMBOLS_PATH):
+        try:
+            with open(DISABLED_SYMBOLS_PATH) as f:
+                data = json.load(f)
+            result = set(data) if isinstance(data, list) else set()
+            if result:
+                log.warning(f"⚠️  Loaded disabled symbols from disk: {result}")
+            return result
+        except (json.JSONDecodeError, ValueError, TypeError):
+            log.warning(f"⚠️  Corrupted {DISABLED_SYMBOLS_PATH} — treating as empty")
+            return set()
+    return set()
+
+
+def save_disabled_symbols(disabled):
+    """Persist disabled symbols to disk."""
+    try:
+        with open(DISABLED_SYMBOLS_PATH, "w") as f:
+            json.dump(sorted(disabled), f)
+    except Exception as e:
+        log.error(f"❌ Failed to save disabled symbols: {e}")
+
+
+# ── Exchange position count ──────────────────────────────────────────────────
+# SAFETY FIX: count real exchange positions, not just local state
+
+def count_exchange_open_positions(client, symbols):
+    """Query exchange for actual open positions across all symbols."""
+    count = 0
+    for sym in symbols:
+        try:
+            pos_info = client.futures_position_information(symbol=sym)
+            if abs(float(pos_info[0]['positionAmt'])) > 0:
+                count += 1
+        except Exception as e:
+            log.error(f"❌ Could not check position for {sym}: {e}")
+            # SAFETY FIX: if we can't check, assume occupied (conservative)
+            count += 1
+    return count
+
 
 # ── Data fetch (futures klines — works from geo-blocked regions like Railway) ─
 def fetch_mtf(client, symbol="BTCUSDT", bars=200):
@@ -331,19 +390,40 @@ def confirm_order_fill(client, symbol, order, requested_qty=0.0, tag=""):
     return False, 0.0, 0.0
 
 
+# SAFETY FIX: emergency close now confirms fill and retries once
 def emergency_close_position(client, symbol, position, qty, tag=""):
-    """Market-close a position immediately. Returns True if order succeeded."""
-    if position == 1:
-        order = close_long(client, symbol, qty)
-    elif position == -1:
-        order = close_short(client, symbol, qty)
-    else:
-        return False
-    if order:
-        log.critical(f"{tag} EMERGENCY CLOSE executed for {symbol} | qty={qty}")
-        return True
-    log.critical(f"{tag} EMERGENCY CLOSE FAILED for {symbol} — MANUAL INTERVENTION REQUIRED")
-    return False
+    """Market-close a position immediately. Returns (success, avg_price, exec_qty).
+    Retries once if first close is not confirmed."""
+    for attempt in range(2):  # SAFETY FIX: attempt + 1 retry
+        if position == 1:
+            order = close_long(client, symbol, qty)
+        elif position == -1:
+            order = close_short(client, symbol, qty)
+        else:
+            return False, 0.0, 0.0
+
+        if order:
+            # SAFETY FIX: confirm the emergency close fill
+            filled, avg_price, exec_qty = confirm_order_fill(
+                client, symbol, order, requested_qty=qty,
+                tag=f"{tag} EMERGENCY_CLOSE")
+            if filled:
+                log.critical(f"{tag} EMERGENCY CLOSE confirmed for {symbol} | "
+                             f"qty={exec_qty} @ ${avg_price:,.2f}")
+                return True, avg_price, exec_qty
+            if attempt == 0:
+                log.critical(f"{tag} EMERGENCY CLOSE not confirmed — retrying once")
+                time.sleep(2)
+                continue
+        else:
+            if attempt == 0:
+                log.critical(f"{tag} EMERGENCY CLOSE order failed — retrying once")
+                time.sleep(2)
+                continue
+
+    log.critical(f"{tag} EMERGENCY CLOSE FAILED for {symbol} after 2 attempts "
+                 f"— MANUAL INTERVENTION REQUIRED")
+    return False, 0.0, 0.0
 
 
 def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
@@ -362,10 +442,34 @@ def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
         return True
     except Exception as e:
         log.critical(f"{tag} SL PLACEMENT FAILED: {e} — closing position immediately")
-        emergency_close_position(client, symbol, position, qty, tag)
+        # SAFETY FIX: use updated emergency_close that confirms fill
+        success, _, _ = emergency_close_position(client, symbol, position, qty, tag)
         disabled_symbols.add(symbol)
-        log.critical(f"{tag} {symbol} DISABLED — SL could not be placed, no unprotected positions allowed")
+        save_disabled_symbols(disabled_symbols)  # SAFETY FIX: persist to disk
+        log.critical(f"{tag} {symbol} DISABLED — SL could not be placed, "
+                     f"no unprotected positions allowed")
         return False
+
+
+# ── Helper: get SL fill price from recent orders ────────────────────────────
+# SAFETY FIX: try to recover actual fill price when SL fired on exchange
+
+def get_sl_fill_price(client, symbol, tag=""):
+    """Try to find the most recent STOP_MARKET fill price for a symbol.
+    Returns the avgPrice if found, or None."""
+    try:
+        recent_orders = client.futures_get_all_orders(symbol=symbol, limit=10)
+        for o in reversed(recent_orders):
+            if (o.get('status') == 'FILLED' and
+                    o.get('type') in ('STOP_MARKET', 'STOP')):
+                avg = float(o.get('avgPrice', 0))
+                if avg > 0:
+                    log.info(f"{tag} Found SL fill: orderId={o['orderId']} "
+                             f"avgPrice=${avg:,.2f}")
+                    return avg
+    except Exception as e:
+        log.error(f"{tag} Could not query recent orders for SL fill: {e}")
+    return None
 
 
 # ── Per-symbol cycle logic ────────────────────────────────────────────────────
@@ -452,7 +556,15 @@ def process_symbol(symbol, ctx):
             exchange_qty = float(pos_info[0]['positionAmt'])
             if exchange_qty == 0 and state['position'] != 0:
                 log.warning(f"{tag} ⚠️  Exchange flat but state={state['position']} — SL likely fired, resyncing")
-                pnl_pct = (current_price - state['entry_price']) / state['entry_price'] * state['position']
+
+                # SAFETY FIX: try to get actual SL fill price instead of using current_price
+                sl_fill_price = get_sl_fill_price(exec_client, symbol, tag)
+                exit_price_for_pnl = sl_fill_price if sl_fill_price else current_price
+                if not sl_fill_price:
+                    log.warning(f"{tag} ⚠️  Could not find SL fill price — using current "
+                                f"${current_price:,.2f} as estimate for PnL")
+
+                pnl_pct = (exit_price_for_pnl - state['entry_price']) / state['entry_price'] * state['position']
                 pnl_usdt = pnl_pct * TRADE_NOTIONAL
                 state['total_pnl_usdt'] += pnl_usdt
                 if pnl_pct > 0:
@@ -464,13 +576,14 @@ def process_symbol(symbol, ctx):
                     if state['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
                         log.critical(f"{tag} {symbol} HIT {MAX_CONSECUTIVE_LOSSES} CONSECUTIVE LOSSES — DISABLING SYMBOL")
                         disabled_symbols.add(symbol)
+                        save_disabled_symbols(disabled_symbols)  # SAFETY FIX: persist
                 if state.get('entry_conditions'):
                     try:
                         memory.record_trade(
                             conditions=state['entry_conditions'],
                             action="BUY" if state['position'] == 1 else "SELL",
                             entry_price=state['entry_price'],
-                            exit_price=current_price,
+                            exit_price=exit_price_for_pnl,  # SAFETY FIX: use best available price
                             pnl_pct=pnl_pct,
                             pnl_usdt=pnl_usdt,
                             confidence=state.get('entry_confidence', 0.5),
@@ -480,6 +593,14 @@ def process_symbol(symbol, ctx):
                         )
                     except Exception as e:
                         log.error(f"{tag} ❌ Memory record failed: {e}")
+                log_trade_event(  # SAFETY FIX: log reconcile close event
+                    symbol, "CLOSE", "LONG" if state['position'] == 1 else "SHORT",
+                    state['qty'], exit_price_for_pnl,
+                    trade_id=state.get('last_trade_id', ''),
+                    pnl_usdt=pnl_usdt, pnl_pct=pnl_pct,
+                    close_reason="SL_RECONCILE",
+                    confidence=state.get('entry_confidence', 0.0),
+                    verdict=state.get('entry_verdict', ''))
                 state['position'] = 0
                 state['entry_price'] = 0.0
                 state['entry_time'] = None
@@ -488,42 +609,81 @@ def process_symbol(symbol, ctx):
                 state['entry_confidence'] = 0.5
                 state['entry_verdict'] = None
                 state['entry_reasoning'] = ""
+                state['breakeven_set'] = False   # SAFETY FIX: reset trailing flags
+                state['trail_1r_set'] = False     # SAFETY FIX: reset trailing flags
                 save_state(state, state_path)
             elif exchange_qty != 0 and state['position'] == 0:
                 # ── Auto-rebuild state from exchange data ────────────────
                 log.critical(f"{tag} Exchange has qty={exchange_qty} but state=flat — rebuilding state from exchange")
                 exchange_entry_price = float(pos_info[0].get('entryPrice', 0))
-                if exchange_qty > 0:
-                    state['position'] = 1
-                    state['qty'] = exchange_qty
+
+                # SAFETY FIX: validate exchange data before rebuilding
+                if abs(exchange_qty) < min_qty:
+                    log.critical(f"{tag} Exchange qty {exchange_qty} below min_qty {min_qty} "
+                                 f"— dust position, skipping rebuild")
+                    # Don't rebuild for dust — it can't be closed normally
                 else:
-                    state['position'] = -1
-                    state['qty'] = abs(exchange_qty)
-                state['entry_price'] = exchange_entry_price if exchange_entry_price > 0 else current_price
-                state['entry_time'] = datetime.now(timezone.utc).isoformat()
-                state['breakeven_set'] = False
-                state['trail_1r_set'] = False
-                log.critical(f"{tag} State rebuilt: position={state['position']} | "
-                             f"entry=${state['entry_price']:,.2f} | qty={state['qty']}")
-                save_state(state, state_path)
-                # Place a fresh SL for the rebuilt position
-                rebuild_sl_pct = state.get('sl_pct', 0.015)
-                if state['position'] == 1:
-                    rebuild_sl_side = "SELL"
-                    rebuild_sl_price = round_price(
-                        state['entry_price'] * (1 - rebuild_sl_pct), tick_size, price_prec)
-                else:
-                    rebuild_sl_side = "BUY"
-                    rebuild_sl_price = round_price(
-                        state['entry_price'] * (1 + rebuild_sl_pct), tick_size, price_prec)
-                try:
-                    exec_client.futures_cancel_all_open_orders(symbol=symbol)
-                except Exception as e:
-                    log.error(f"{tag} Failed to cancel stale orders during rebuild: {e}")
-                safe_place_sl_or_exit(
-                    exec_client, symbol, rebuild_sl_side, rebuild_sl_price,
-                    state['position'], state['qty'], disabled_symbols, tag)
-                # Continue cycle with rebuilt state (do NOT return)
+                    if exchange_qty > 0:
+                        state['position'] = 1
+                        state['qty'] = exchange_qty
+                    else:
+                        state['position'] = -1
+                        state['qty'] = abs(exchange_qty)
+
+                    # SAFETY FIX: warn if entryPrice is missing/zero
+                    if exchange_entry_price <= 0:
+                        log.warning(f"{tag} ⚠️  Exchange entryPrice is {exchange_entry_price} "
+                                    f"— using current_price ${current_price:,.2f} as fallback")
+                    state['entry_price'] = exchange_entry_price if exchange_entry_price > 0 else current_price
+                    state['entry_time'] = datetime.now(timezone.utc).isoformat()
+                    state['breakeven_set'] = False
+                    state['trail_1r_set'] = False
+                    log.critical(f"{tag} State rebuilt: position={state['position']} | "
+                                 f"entry=${state['entry_price']:,.2f} | qty={state['qty']}")
+                    save_state(state, state_path)
+                    # Place a fresh SL for the rebuilt position
+                    rebuild_sl_pct = state.get('sl_pct', 0.015)
+                    if state['position'] == 1:
+                        rebuild_sl_side = "SELL"
+                        rebuild_sl_price = round_price(
+                            state['entry_price'] * (1 - rebuild_sl_pct), tick_size, price_prec)
+                    else:
+                        rebuild_sl_side = "BUY"
+                        rebuild_sl_price = round_price(
+                            state['entry_price'] * (1 + rebuild_sl_pct), tick_size, price_prec)
+                    try:
+                        exec_client.futures_cancel_all_open_orders(symbol=symbol)
+                    except Exception as e:
+                        log.error(f"{tag} Failed to cancel stale orders during rebuild: {e}")
+                    safe_place_sl_or_exit(
+                        exec_client, symbol, rebuild_sl_side, rebuild_sl_price,
+                        state['position'], state['qty'], disabled_symbols, tag)
+                    # Continue cycle with rebuilt state (do NOT return)
+
+            # SAFETY FIX: detect sign disagreement between local state and exchange
+            elif exchange_qty != 0 and state['position'] != 0:
+                exchange_side = 1 if exchange_qty > 0 else -1
+                if exchange_side != state['position']:
+                    log.critical(f"{tag} SIDE MISMATCH: local={state['position']} "
+                                 f"exchange={exchange_side} (qty={exchange_qty}) "
+                                 f"— closing exchange position and resetting state")
+                    # Close the exchange position to resolve ambiguity
+                    success, _, _ = emergency_close_position(
+                        exec_client, symbol, exchange_side, abs(exchange_qty), tag)
+                    state['position'] = 0
+                    state['entry_price'] = 0.0
+                    state['entry_time'] = None
+                    state['qty'] = 0.0
+                    state['entry_conditions'] = None
+                    state['breakeven_set'] = False
+                    state['trail_1r_set'] = False
+                    save_state(state, state_path)
+                    if not success:
+                        disabled_symbols.add(symbol)
+                        save_disabled_symbols(disabled_symbols)
+                        log.critical(f"{tag} {symbol} DISABLED — could not resolve side mismatch")
+                    return  # skip rest of cycle after mismatch resolution
+
         except Exception as e:
             log.error(f"{tag} ❌ Position reconcile failed: {e}")
 
@@ -595,19 +755,20 @@ def process_symbol(symbol, ctx):
                     log.warning(f"{tag} Duplicate signal on same bar — trade_id={trade_id} — skipping")
                     return
 
-                # ── Global exposure limit ────────────────────────────────
-                open_count = sum(1 for s in SYMBOLS if ctx['states'][s]['position'] != 0)
+                # SAFETY FIX: use exchange positions for exposure limit, not local state
+                open_count = count_exchange_open_positions(exec_client, SYMBOLS)
                 if open_count >= MAX_CONCURRENT_POSITIONS:
                     log.warning(f"{tag} Exposure limit: {open_count}/{MAX_CONCURRENT_POSITIONS} "
-                                f"positions open — blocking new entry")
+                                f"exchange positions open — blocking new entry")
                     return
 
                 sl_pct, tp_pct = get_dynamic_sl_tp(conditions, memory)
 
                 # ── Risk-based position sizing ───────────────────────────
                 pre_trade_balance = fetch_live_balance(exec_client)
-                if pre_trade_balance <= 0:
-                    log.error(f"{tag} Balance fetch returned ${pre_trade_balance:.2f} — aborting entry")
+                # SAFETY FIX: handle None from fetch_live_balance
+                if pre_trade_balance is None or pre_trade_balance <= 0:
+                    log.error(f"{tag} Balance fetch returned {pre_trade_balance} — aborting entry")
                     return
                 risk_per_trade = pre_trade_balance * RISK_PER_TRADE_PCT
                 risk_notional = risk_per_trade / max(sl_pct, 0.001)
@@ -650,6 +811,8 @@ def process_symbol(symbol, ctx):
                     state['entry_verdict'] = verdict
                     state['entry_reasoning'] = reasoning_text[:300]
                     state['last_trade_id'] = trade_id
+                    state['breakeven_set'] = False   # SAFETY FIX: ensure clean on new entry
+                    state['trail_1r_set'] = False     # SAFETY FIX: ensure clean on new entry
                     save_state(state, state_path)
                     log.info(f"{tag} 📈 LONG opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
                     sl_price = round_price(actual_price * (1 - sl_pct), tick_size, price_prec)
@@ -693,6 +856,8 @@ def process_symbol(symbol, ctx):
                     state['entry_verdict'] = verdict
                     state['entry_reasoning'] = reasoning_text[:300]
                     state['last_trade_id'] = trade_id
+                    state['breakeven_set'] = False   # SAFETY FIX: ensure clean on new entry
+                    state['trail_1r_set'] = False     # SAFETY FIX: ensure clean on new entry
                     save_state(state, state_path)
                     log.info(f"{tag} 📉 SHORT opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
                     sl_price = round_price(actual_price * (1 + sl_pct), tick_size, price_prec)
@@ -842,7 +1007,34 @@ def process_symbol(symbol, ctx):
                     order = close_short(exec_client, symbol, qty)
 
                 if order:
-                    pnl_pct = (current_price - entry) / entry * pos
+                    # SAFETY FIX: confirm exit fill before updating state
+                    filled, exit_avg_price, exit_exec_qty = confirm_order_fill(
+                        exec_client, symbol, order, requested_qty=qty,
+                        tag=f"{tag} EXIT")
+
+                    if not filled:
+                        # SAFETY FIX: retry close once if not confirmed
+                        log.critical(f"{tag} EXIT order NOT confirmed — retrying close")
+                        if pos == 1:
+                            order2 = close_long(exec_client, symbol, qty)
+                        else:
+                            order2 = close_short(exec_client, symbol, qty)
+                        if order2:
+                            filled, exit_avg_price, exit_exec_qty = confirm_order_fill(
+                                exec_client, symbol, order2, requested_qty=qty,
+                                tag=f"{tag} EXIT_RETRY")
+                        if not filled:
+                            log.critical(f"{tag} EXIT STILL NOT CONFIRMED after retry "
+                                         f"— MANUAL INTERVENTION REQUIRED — state NOT updated")
+                            return  # SAFETY FIX: do not update state if exit unconfirmed
+
+                    # SAFETY FIX: use actual fill price for PnL, not current_price
+                    exit_price = exit_avg_price if exit_avg_price > 0 else current_price
+                    if exit_avg_price <= 0:
+                        log.warning(f"{tag} ⚠️  Exit avgPrice=0 — using current_price "
+                                    f"${current_price:,.2f} as fallback")
+
+                    pnl_pct = (exit_price - entry) / entry * pos  # SAFETY FIX: exit_price not current_price
                     pnl_usdt = pnl_pct * TRADE_NOTIONAL
                     state['total_pnl_usdt'] += pnl_usdt
                     if pnl_pct > 0:
@@ -854,13 +1046,14 @@ def process_symbol(symbol, ctx):
                         if state['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
                             log.critical(f"{tag} {symbol} HIT {MAX_CONSECUTIVE_LOSSES} CONSECUTIVE LOSSES — DISABLING SYMBOL")
                             disabled_symbols.add(symbol)
+                            save_disabled_symbols(disabled_symbols)  # SAFETY FIX: persist
                     wr = state['wins'] / max(1, state['wins'] + state['losses'])
                     side_name = "LONG" if pos == 1 else "SHORT"
-                    log.info(f"{tag} 💰 {side_name} closed @ ${current_price:,.2f} | "
+                    log.info(f"{tag} 💰 {side_name} closed @ ${exit_price:,.2f} | "
                              f"PnL: ${pnl_usdt:+.2f} ({pnl_pct*100:+.2f}%) | "
                              f"WR: {wr:.1%} | Total: ${state['total_pnl_usdt']:+.2f}")
                     log_trade_event(
-                        symbol, "CLOSE", side_name, qty, current_price,
+                        symbol, "CLOSE", side_name, qty, exit_price,  # SAFETY FIX: exit_price
                         trade_id=state.get('last_trade_id', ''),
                         pnl_usdt=pnl_usdt, pnl_pct=pnl_pct,
                         close_reason=close_reason or "UNKNOWN",
@@ -873,7 +1066,7 @@ def process_symbol(symbol, ctx):
                                 conditions=state['entry_conditions'],
                                 action="BUY" if pos == 1 else "SELL",
                                 entry_price=entry,
-                                exit_price=current_price,
+                                exit_price=exit_price,  # SAFETY FIX: actual fill price
                                 pnl_pct=pnl_pct,
                                 pnl_usdt=pnl_usdt,
                                 confidence=state.get('entry_confidence', 0.5),
@@ -895,6 +1088,10 @@ def process_symbol(symbol, ctx):
                     state['breakeven_set'] = False
                     state['trail_1r_set'] = False
                     save_state(state, state_path)
+                else:
+                    # SAFETY FIX: close order placement itself failed — log critical
+                    log.critical(f"{tag} EXIT order placement FAILED — position still open, "
+                                 f"exchange SL should protect")
 
         wr = state['wins'] / max(1, state['wins'] + state['losses'])
         log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
@@ -933,18 +1130,22 @@ def main():
         log.error(f"❌ Connection failed: {e}")
         return
 
-    # Live balance + per-trade loss cap + global kill switch
-    live_balance = fetch_live_balance(exec_client)
+    # SAFETY FIX: capture starting balance from exchange — used for kill switch
+    starting_balance = fetch_live_balance(exec_client)
+    if starting_balance is None or starting_balance <= 0:
+        log.error(f"❌ Cannot fetch starting balance ({starting_balance}) — aborting")
+        return
     max_loss_per_trade = TRADE_NOTIONAL * 0.03
-    daily_loss_limit = -(live_balance * 0.05)
-    last_balance_refresh = datetime.now(timezone.utc)
-    log.info(f"💰 Balance: ${live_balance:,.2f} | Max loss/trade: ${max_loss_per_trade:.2f} | Global kill switch: ${daily_loss_limit:.2f}")
+    log.info(f"💰 Starting balance: ${starting_balance:,.2f} | "
+             f"Max loss/trade: ${max_loss_per_trade:.2f} | "
+             f"Kill switch: {KILL_SWITCH_DRAWDOWN_PCT:.0%} drawdown = "
+             f"${starting_balance * KILL_SWITCH_DRAWDOWN_PCT:,.2f}")
 
     # Margin sanity — scaled by number of symbols (worst case: all simultaneously in position)
     required_margin_per_trade = TRADE_NOTIONAL / LEVERAGE
     total_margin_worst_case = required_margin_per_trade * len(SYMBOLS)
-    if live_balance < total_margin_worst_case * 1.5:
-        log.warning(f"⚠️  Low balance: ${live_balance:.2f} may be insufficient for worst-case "
+    if starting_balance < total_margin_worst_case * 1.5:
+        log.warning(f"⚠️  Low balance: ${starting_balance:.2f} may be insufficient for worst-case "
                     f"${total_margin_worst_case:.2f} margin (${required_margin_per_trade:.2f} × {len(SYMBOLS)} symbols)")
 
     # Per-symbol leverage setup
@@ -992,7 +1193,11 @@ def main():
     log.info(f"📡 Multi-symbol live loop active — {len(SYMBOLS)} symbols, every 5 min")
     log.info(f"{'='*60}\n")
 
-    disabled_symbols = set()
+    # SAFETY FIX: load disabled symbols from disk — persists across restarts
+    disabled_symbols = load_disabled_symbols()
+    if disabled_symbols:
+        log.critical(f"🚫 Symbols disabled from previous session: {disabled_symbols} "
+                     f"— delete {DISABLED_SYMBOLS_PATH} to re-enable")
 
     ctx = {
         'data_client': data_client,
@@ -1008,19 +1213,18 @@ def main():
 
     while True:
         try:
-            # Refresh live balance every 24h
-            hours_since_refresh = (datetime.now(timezone.utc) - last_balance_refresh).total_seconds() / 3600
-            if hours_since_refresh >= 24:
-                live_balance = fetch_live_balance(exec_client)
-                ctx['max_loss_per_trade'] = TRADE_NOTIONAL * 0.03
-                daily_loss_limit = -(live_balance * 0.05)
-                last_balance_refresh = datetime.now(timezone.utc)
-                log.info(f"💰 Balance refreshed: ${live_balance:,.2f} | Kill switch: ${daily_loss_limit:.2f}")
-
-            # ── Global kill switch — sum PnL across all symbols ──
-            total_pnl_all = sum(states[s]['total_pnl_usdt'] for s in SYMBOLS)
-            if total_pnl_all < daily_loss_limit:
-                log.error(f"🛑 GLOBAL kill switch: total PnL ${total_pnl_all:.2f} < ${daily_loss_limit:.2f}. Shutting down all symbols.")
+            # SAFETY FIX: exchange-based kill switch — fresh balance every cycle
+            current_balance = fetch_live_balance(exec_client)
+            if current_balance is None:
+                log.error("🛑 Cannot fetch balance — skipping cycle for safety")
+                time.sleep(FETCH_EVERY)
+                continue
+            drawdown = current_balance - starting_balance
+            if drawdown < -(starting_balance * KILL_SWITCH_DRAWDOWN_PCT):
+                log.error(f"🛑 GLOBAL KILL SWITCH: balance ${current_balance:,.2f} = "
+                          f"${drawdown:+,.2f} from start ${starting_balance:,.2f} "
+                          f"(>{KILL_SWITCH_DRAWDOWN_PCT:.0%} drawdown). "
+                          f"Shutting down ALL symbols.")
                 return
 
             # ── Per-symbol cycle (try/except inside process_symbol — one bad symbol can't stall others) ──
@@ -1030,7 +1234,8 @@ def main():
             if disabled_symbols:
                 log.critical(f"🚫 Disabled symbols: {disabled_symbols}")
             active_count = len(SYMBOLS) - len(disabled_symbols)
-            log.info(f"\n💼 Cycle done | {active_count}/{len(SYMBOLS)} active | Total PnL: ${total_pnl_all:+.2f}\n")
+            log.info(f"\n💼 Cycle done | {active_count}/{len(SYMBOLS)} active | "
+                     f"Balance: ${current_balance:,.2f} | Drawdown: ${drawdown:+,.2f}\n")
 
         except KeyboardInterrupt:
             log.info("\n⏹️  Agent stopped by user")
