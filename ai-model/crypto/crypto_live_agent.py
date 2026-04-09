@@ -262,10 +262,10 @@ def fetch_mtf(client, symbol="BTCUSDT", bars=200):
             df[col] = df[col].astype(float)
         return df[['ts','open','high','low','close','volume']].set_index('ts')
 
-    df_1h = fetch_tf(Client.KLINE_INTERVAL_1HOUR,  bars)
-    df_4h = fetch_tf(Client.KLINE_INTERVAL_4HOUR,  bars)
-    df_1d = fetch_tf(Client.KLINE_INTERVAL_1DAY,   bars)
-    df_1w = fetch_tf(Client.KLINE_INTERVAL_1WEEK,  bars)
+    df_1h  = fetch_tf(Client.KLINE_INTERVAL_1HOUR,  bars)
+    df_4h  = fetch_tf(Client.KLINE_INTERVAL_4HOUR,  bars)
+    df_1d  = fetch_tf(Client.KLINE_INTERVAL_1DAY,   bars)
+    df_1w  = fetch_tf(Client.KLINE_INTERVAL_1WEEK,  bars)
 
     df_4h_ff = df_4h.reindex(df_1h.index, method='ffill').add_prefix('h4_')
     df_1d_ff = df_1d.reindex(df_1h.index, method='ffill').add_prefix('d1_')
