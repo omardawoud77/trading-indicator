@@ -1,0 +1,5 @@
+[build]
+rootDirectory = "ai-model"
+
+[deploy]
+startCommand = "cd crypto && python3 crypto_live_agent.py"
