@@ -63,6 +63,36 @@ def trade_log_path_for(symbol):
         return os.path.join(HERE, "trade_log.csv")
     return os.path.join(HERE, f"trade_log_{symbol.lower()}.csv")
 
+def trade_events_path_for(symbol):
+    return os.path.join(HERE, f"trade_events_{symbol.lower()}.jsonl")
+
+def log_trade_event(symbol, event_type, action, qty, price, trade_id="",
+                    sl_price=0.0, tp_pct=0.0, pnl_usdt=0.0, pnl_pct=0.0,
+                    close_reason="", confidence=0.0, verdict=""):
+    """Append a structured JSON line to trade_events_{symbol}.jsonl."""
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "event_type": event_type,
+        "action": action,
+        "qty": qty,
+        "price": price,
+        "sl_price": sl_price,
+        "tp_pct": tp_pct,
+        "pnl_usdt": pnl_usdt,
+        "pnl_pct": pnl_pct,
+        "close_reason": close_reason,
+        "confidence": confidence,
+        "verdict": verdict,
+    }
+    path = trade_events_path_for(symbol)
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except Exception as e:
+        log.error(f"[{symbol[:3]}] Failed to write trade event: {e}")
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -257,7 +287,7 @@ def close_short(client, symbol, qty):
     return place_futures_order(client, symbol, "BUY", qty, reduce_only=True)
 
 
-def confirm_order_fill(client, symbol, order, tag=""):
+def confirm_order_fill(client, symbol, order, requested_qty=0.0, tag=""):
     """Query order status to confirm fill. Returns (filled, avg_price, exec_qty) or
     (False, 0, 0) if not filled. Retries up to 3 times with short waits."""
     order_id = order.get('orderId')
@@ -279,6 +309,8 @@ def confirm_order_fill(client, symbol, order, tag=""):
             elif status == 'PARTIALLY_FILLED':
                 log.warning(f"{tag} Order {order_id} PARTIALLY_FILLED | "
                             f"avgPrice=${avg_price:,.2f} | execQty={exec_qty}")
+                log.warning(f"{tag} PARTIAL FILL: requested {requested_qty} got {exec_qty} "
+                            f"— SL will close full position via closePosition=true")
                 return True, avg_price, exec_qty
             elif status in ('NEW', 'PENDING_NEW'):
                 if attempt < 2:
@@ -458,9 +490,40 @@ def process_symbol(symbol, ctx):
                 state['entry_reasoning'] = ""
                 save_state(state, state_path)
             elif exchange_qty != 0 and state['position'] == 0:
-                log.warning(f"{tag} ⚠️  Exchange has qty={exchange_qty} but state=flat — manual resolution needed")
-                log.warning(f"{tag}    Skipping this bar to avoid double-trading")
-                return
+                # ── Auto-rebuild state from exchange data ────────────────
+                log.critical(f"{tag} Exchange has qty={exchange_qty} but state=flat — rebuilding state from exchange")
+                exchange_entry_price = float(pos_info[0].get('entryPrice', 0))
+                if exchange_qty > 0:
+                    state['position'] = 1
+                    state['qty'] = exchange_qty
+                else:
+                    state['position'] = -1
+                    state['qty'] = abs(exchange_qty)
+                state['entry_price'] = exchange_entry_price if exchange_entry_price > 0 else current_price
+                state['entry_time'] = datetime.now(timezone.utc).isoformat()
+                state['breakeven_set'] = False
+                state['trail_1r_set'] = False
+                log.critical(f"{tag} State rebuilt: position={state['position']} | "
+                             f"entry=${state['entry_price']:,.2f} | qty={state['qty']}")
+                save_state(state, state_path)
+                # Place a fresh SL for the rebuilt position
+                rebuild_sl_pct = state.get('sl_pct', 0.015)
+                if state['position'] == 1:
+                    rebuild_sl_side = "SELL"
+                    rebuild_sl_price = round_price(
+                        state['entry_price'] * (1 - rebuild_sl_pct), tick_size, price_prec)
+                else:
+                    rebuild_sl_side = "BUY"
+                    rebuild_sl_price = round_price(
+                        state['entry_price'] * (1 + rebuild_sl_pct), tick_size, price_prec)
+                try:
+                    exec_client.futures_cancel_all_open_orders(symbol=symbol)
+                except Exception as e:
+                    log.error(f"{tag} Failed to cancel stale orders during rebuild: {e}")
+                safe_place_sl_or_exit(
+                    exec_client, symbol, rebuild_sl_side, rebuild_sl_price,
+                    state['position'], state['qty'], disabled_symbols, tag)
+                # Continue cycle with rebuilt state (do NOT return)
         except Exception as e:
             log.error(f"{tag} ❌ Position reconcile failed: {e}")
 
@@ -567,7 +630,7 @@ def process_symbol(symbol, ctx):
                 if order:
                     # ── Confirm fill before updating state ───────────────
                     filled, avg_price, exec_qty = confirm_order_fill(
-                        exec_client, symbol, order, tag)
+                        exec_client, symbol, order, requested_qty=qty, tag=tag)
                     if not filled:
                         log.critical(f"{tag} LONG order NOT confirmed filled — state NOT updated")
                         return
@@ -590,6 +653,9 @@ def process_symbol(symbol, ctx):
                     save_state(state, state_path)
                     log.info(f"{tag} 📈 LONG opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
                     sl_price = round_price(actual_price * (1 - sl_pct), tick_size, price_prec)
+                    log_trade_event(symbol, "OPEN", "LONG", actual_qty, actual_price,
+                                    trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
+                                    confidence=confidence, verdict=verdict)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "SELL", sl_price,
                         state['position'], actual_qty, disabled_symbols, tag)
@@ -607,7 +673,7 @@ def process_symbol(symbol, ctx):
                 if order:
                     # ── Confirm fill before updating state ───────────────
                     filled, avg_price, exec_qty = confirm_order_fill(
-                        exec_client, symbol, order, tag)
+                        exec_client, symbol, order, requested_qty=qty, tag=tag)
                     if not filled:
                         log.critical(f"{tag} SHORT order NOT confirmed filled — state NOT updated")
                         return
@@ -630,6 +696,9 @@ def process_symbol(symbol, ctx):
                     save_state(state, state_path)
                     log.info(f"{tag} 📉 SHORT opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
                     sl_price = round_price(actual_price * (1 + sl_pct), tick_size, price_prec)
+                    log_trade_event(symbol, "OPEN", "SHORT", actual_qty, actual_price,
+                                    trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
+                                    confidence=confidence, verdict=verdict)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "BUY", sl_price,
                         state['position'], actual_qty, disabled_symbols, tag)
@@ -756,8 +825,10 @@ def process_symbol(symbol, ctx):
                 half_tp = tp_pct * 0.5
                 if upnl_pct < 0:
                     allow_voluntary_close = True
+                    close_reason = "VOLUNTARY"
                 elif upnl_pct >= half_tp:
                     allow_voluntary_close = True
+                    close_reason = "VOLUNTARY"
                     log.info(f"{tag} 💰 Voluntary close allowed — profit {upnl_pct*100:+.2f}% past 50% TP")
                 else:
                     log.info(f"{tag} 🔒 Voluntary close blocked — profit {upnl_pct*100:+.2f}% < 50% TP, let trail handle exit")
@@ -788,6 +859,13 @@ def process_symbol(symbol, ctx):
                     log.info(f"{tag} 💰 {side_name} closed @ ${current_price:,.2f} | "
                              f"PnL: ${pnl_usdt:+.2f} ({pnl_pct*100:+.2f}%) | "
                              f"WR: {wr:.1%} | Total: ${state['total_pnl_usdt']:+.2f}")
+                    log_trade_event(
+                        symbol, "CLOSE", side_name, qty, current_price,
+                        trade_id=state.get('last_trade_id', ''),
+                        pnl_usdt=pnl_usdt, pnl_pct=pnl_pct,
+                        close_reason=close_reason or "UNKNOWN",
+                        confidence=state.get('entry_confidence', 0.0),
+                        verdict=state.get('entry_verdict', ''))
 
                     if state.get('entry_conditions'):
                         try:
