@@ -584,8 +584,7 @@ def classify_setup_quality(conditions, confidence, memory, perception):  # QUALI
     expectancy = memory.get_expectancy(conditions)  # QUALITY TIER
 
     # TRASH tier — block immediately  # QUALITY TIER
-    if confidence < 0.50:  # QUALITY TIER
-        return 'TRASH'  # QUALITY TIER
+    # TRASH_FIX: removed confidence < 0.50 gate — trust PPO signal quality  # TRASH_FIX
     if regime == 'HIGH_VOLATILITY' and atr_pct > 0.03:  # QUALITY TIER
         return 'TRASH'  # QUALITY TIER
     if expectancy is not None and expectancy < -0.3:  # QUALITY TIER
