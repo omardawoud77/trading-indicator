@@ -605,7 +605,7 @@ def classify_setup_quality(conditions, confidence, memory, perception):  # QUALI
         return 'A'  # QUALITY TIER
 
     # B tier — marginal  # QUALITY TIER
-    if confidence >= 0.50 and regime != 'HIGH_VOLATILITY':  # QUALITY TIER
+    if confidence >= 0.0 and regime != 'HIGH_VOLATILITY':  # B_TIER_FIX: was 0.50 — allow all signals through at 50% size
         return 'B'  # QUALITY TIER
 
     return 'TRASH'  # QUALITY TIER
