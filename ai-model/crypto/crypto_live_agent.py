@@ -431,15 +431,22 @@ def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
     """Place a STOP_MARKET SL order. If placement fails, immediately market-close
     the position and disable the symbol. Returns True if SL was placed OK."""
     try:
-        sl_order = client.futures_create_order(
-            symbol=symbol,
-            side=sl_side,
-            type="STOP_MARKET",
-            stopPrice=sl_price,
-            closePosition="true",
-            workingType="CONTRACT_PRICE",  # SL_FIX: use contract price, not mark price
-        )
-        log.info(f"{tag} SL confirmed — orderId: {sl_order['orderId']} @ ${sl_price}")
+        # SL_ALGO_FIX: use Algo Order API to fix APIError -4120
+        sl_order = client._request_futures_api(  # SL_ALGO_FIX
+            "post",  # SL_ALGO_FIX
+            "order/algo",  # SL_ALGO_FIX
+            True,  # SL_ALGO_FIX
+            data={  # SL_ALGO_FIX
+                "symbol": symbol,  # SL_ALGO_FIX
+                "side": sl_side,  # SL_ALGO_FIX
+                "type": "STOP",  # SL_ALGO_FIX
+                "stopPrice": str(sl_price),  # SL_ALGO_FIX
+                "closePosition": "true",  # SL_ALGO_FIX
+                "workingType": "CONTRACT_PRICE",  # SL_ALGO_FIX
+                "timeInForce": "GTE_GTC",  # SL_ALGO_FIX
+            }  # SL_ALGO_FIX
+        )  # SL_ALGO_FIX
+        log.info(f"{tag} SL confirmed — orderId: {sl_order.get('orderId', '?')} @ ${sl_price}")  # SL_ALGO_FIX
         return True
     except Exception as e:
         log.critical(f"{tag} SL PLACEMENT FAILED: {e} — closing position immediately")
