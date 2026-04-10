@@ -265,15 +265,13 @@ def classify_regime(conditions, perception):  # REGIME FILTER
     # TRENDING_BULL: strong trend + aligned momentum + not chaotic  # REGIME FILTER
     if (trend == 'STRONG_BULL'  # REGIME FILTER
             and momentum in ('STRONG_UP', 'WEAK_UP')  # REGIME FILTER
-            and volatility != 'HIGH'  # REGIME FILTER
-            and volume != 'LOW'):  # REGIME FILTER
+            and volatility != 'HIGH'):  # REGIME FILTER
         return 'TRENDING_BULL'  # REGIME FILTER
 
     # TRENDING_BEAR: strong trend + aligned momentum + not chaotic  # REGIME FILTER
     if (trend == 'STRONG_BEAR'  # REGIME FILTER
             and momentum in ('STRONG_DOWN', 'WEAK_DOWN')  # REGIME FILTER
-            and volatility != 'HIGH'  # REGIME FILTER
-            and volume != 'LOW'):  # REGIME FILTER
+            and volatility != 'HIGH'):  # REGIME FILTER
         return 'TRENDING_BEAR'  # REGIME FILTER
 
     # RANGING: mild trend + weak momentum + low/normal volume  # REGIME FILTER
@@ -426,7 +424,7 @@ def reason(ppo_action, conditions, perception, memory):
             confidence -= 0.05  # GATE REDESIGN: was 0.10
         elif regime == 'LOW_QUALITY':  # REGIME FILTER  # REGIME TUNE
             evidence_against.append("Regime LOW_QUALITY — conflicting signals, no clear setup")  # REGIME TUNE
-            confidence -= 0.05  # GATE REDESIGN: was 0.10
+            confidence -= 0.00  # GATE REDESIGN: was 0.10
 
         # Memory check
         veto, wr = memory.should_veto(conditions)
