@@ -35,7 +35,7 @@ from trade_memory import TradeMemory
 SYMBOLS         = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TRADE_NOTIONAL  = 1500.0         # USDT notional per trade per symbol
 LEVERAGE        = 3              # 3× leverage
-FETCH_EVERY     = 300            # seconds between cycles (5 min)
+FETCH_EVERY     = 60             # seconds between cycles (1 min)
 MAX_DAILY_TRADES = 6             # max NEW entries per UTC day PER SYMBOL (18 total across 3)
 MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
 MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
