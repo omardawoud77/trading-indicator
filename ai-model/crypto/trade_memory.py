@@ -205,7 +205,7 @@ class TradeMemory:
         expectancy = (wr * avg_win_r) + ((1 - wr) * avg_loss_r)  # EXPECTANCY
         return expectancy  # EXPECTANCY
 
-    def should_veto(self, conditions, min_trades=10, veto_threshold=0.35):  # FREQUENCY TUNE: was 0.45
+    def should_veto(self, conditions, min_trades=20, veto_threshold=0.25):  # VETO_FIX: was min=10, threshold=0.35
         stats = self.find_similar(conditions)
         if not stats or stats["total"] < min_trades:
             return False, None
