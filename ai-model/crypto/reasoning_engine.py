@@ -473,16 +473,26 @@ def reason(ppo_action, conditions, perception, memory):
     # Clamp confidence
     confidence = max(0.05, min(0.95, confidence))
 
-    # Verdict
-    if ppo_action in (1, 2):
-        if confidence >= 0.68:  # FREQUENCY TUNE: was 0.72
-            verdict = "EXECUTE"
-        elif confidence >= 0.58:  # FREQUENCY TUNE: was 0.62
-            verdict = "WEAK_EXECUTE"
-        else:
-            verdict = "REJECT"
-    else:
-        verdict = "EXECUTE" if confidence >= 0.50 else "REJECT"
+    # Verdict — GATE BYPASS: trust PPO, only block truly terrible setups  # GATE BYPASS
+    if ppo_action in (1, 2):  # GATE BYPASS
+        # Block 1: memory veto (WR < 0.35 historically)  # GATE BYPASS
+        veto_fired, veto_wr = memory.should_veto(conditions)  # GATE BYPASS
+        # Block 2: extreme volatility  # GATE BYPASS
+        regime = conditions.get('regime', 'LOW_QUALITY')  # GATE BYPASS
+        atr_pct = perception.get('atr_pct', 0.0)  # GATE BYPASS
+        high_vol_block = (regime == 'HIGH_VOLATILITY' and atr_pct > 0.03)  # GATE BYPASS
+        if veto_fired:  # GATE BYPASS
+            verdict = "REJECT"  # GATE BYPASS
+            evidence_against.append(f"GATE BYPASS BLOCK: memory veto WR={veto_wr:.0%}")  # GATE BYPASS
+        elif high_vol_block:  # GATE BYPASS
+            verdict = "REJECT"  # GATE BYPASS
+            evidence_against.append(f"GATE BYPASS BLOCK: HIGH_VOLATILITY + ATR={atr_pct:.2%}")  # GATE BYPASS
+        else:  # GATE BYPASS
+            verdict = "EXECUTE"  # GATE BYPASS
+    elif ppo_action == 3:  # CLOSE always executes  # GATE BYPASS
+        verdict = "EXECUTE"  # GATE BYPASS
+    else:  # HOLD  # GATE BYPASS
+        verdict = "EXECUTE"  # GATE BYPASS
 
     return verdict, confidence, evidence_for, evidence_against
 
