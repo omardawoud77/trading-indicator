@@ -119,6 +119,7 @@ DEFAULT_STATE = {
     "daily_trades": 0,
     "last_trade_date": None,
     "sl_pct": 0.015,
+    "sl_price": 0.0,  # SL_SOFTWARE: absolute SL price for software-managed stop
     "tp_pct": 0.04,
     "entry_conditions": None,
     "entry_confidence": 0.5,
@@ -427,30 +428,16 @@ def emergency_close_position(client, symbol, position, qty, tag=""):
 
 
 def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
-                          disabled_symbols, tag=""):
-    """Place a STOP_MARKET SL order. If placement fails, immediately market-close
-    the position and disable the symbol. Returns True if SL was placed OK."""
-    try:
-        sl_order = client.futures_create_order(  # SL_REDUCEONLY_FIX
-            symbol=symbol,  # SL_REDUCEONLY_FIX
-            side=sl_side,  # SL_REDUCEONLY_FIX
-            type="STOP_MARKET",  # SL_REDUCEONLY_FIX
-            stopPrice=sl_price,  # SL_REDUCEONLY_FIX
-            quantity=qty,  # SL_REDUCEONLY_FIX
-            reduceOnly=True,  # SL_REDUCEONLY_FIX
-            workingType="CONTRACT_PRICE",  # SL_REDUCEONLY_FIX
-        )  # SL_REDUCEONLY_FIX
-        log.info(f"{tag} SL confirmed — orderId: {sl_order['orderId']} @ ${sl_price}")
-        return True
-    except Exception as e:
-        log.critical(f"{tag} SL PLACEMENT FAILED: {e} — closing position immediately")
-        # SAFETY FIX: use updated emergency_close that confirms fill
-        success, _, _ = emergency_close_position(client, symbol, position, qty, tag)
-        disabled_symbols.add(symbol)
-        save_disabled_symbols(disabled_symbols)  # SAFETY FIX: persist to disk
-        log.critical(f"{tag} {symbol} DISABLED — SL could not be placed, "
-                     f"no unprotected positions allowed")
-        return False
+                          disabled_symbols, tag="", state=None):  # SL_SOFTWARE
+    """SL_SOFTWARE: testnet doesn't support STOP_MARKET, manage SL in software.
+    Stores the SL price in state for the cycle loop to check on each bar.
+    The unused exchange-related parameters are kept for call-site compatibility."""  # SL_SOFTWARE
+    if state is not None:  # SL_SOFTWARE
+        state['sl_price'] = float(sl_price)  # SL_SOFTWARE
+        log.info(f"{tag} SL stored in software @ ${sl_price} (side={sl_side})")  # SL_SOFTWARE
+    else:  # SL_SOFTWARE
+        log.warning(f"{tag} SL_SOFTWARE: state not passed — SL price NOT persisted")  # SL_SOFTWARE
+    return True  # SL_SOFTWARE
 
 
 # ── Helper: get SL fill price from recent orders ────────────────────────────
@@ -613,6 +600,7 @@ def process_symbol(symbol, ctx):
                 state['entry_reasoning'] = ""
                 state['breakeven_set'] = False   # SAFETY FIX: reset trailing flags
                 state['trail_1r_set'] = False     # SAFETY FIX: reset trailing flags
+                state['sl_price'] = 0.0  # SL_SOFTWARE: reset SL on close
                 save_state(state, state_path)
             elif exchange_qty != 0 and state['position'] == 0:
                 # ── Auto-rebuild state from exchange data ────────────────
@@ -640,6 +628,7 @@ def process_symbol(symbol, ctx):
                     state['entry_time'] = datetime.now(timezone.utc).isoformat()
                     state['breakeven_set'] = False
                     state['trail_1r_set'] = False
+                    state['sl_price'] = 0.0  # SL_SOFTWARE: rebuild SL fresh below
                     log.critical(f"{tag} State rebuilt: position={state['position']} | "
                                  f"entry=${state['entry_price']:,.2f} | qty={state['qty']}")
                     save_state(state, state_path)
@@ -659,7 +648,9 @@ def process_symbol(symbol, ctx):
                         log.error(f"{tag} Failed to cancel stale orders during rebuild: {e}")
                     safe_place_sl_or_exit(
                         exec_client, symbol, rebuild_sl_side, rebuild_sl_price,
-                        state['position'], state['qty'], disabled_symbols, tag)
+                        state['position'], state['qty'], disabled_symbols, tag,
+                        state=state)  # SL_SOFTWARE
+                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
                     # Continue cycle with rebuilt state (do NOT return)
 
             # SAFETY FIX: detect sign disagreement between local state and exchange
@@ -836,7 +827,9 @@ def process_symbol(symbol, ctx):
                                     confidence=confidence, verdict=verdict)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "SELL", sl_price,
-                        state['position'], actual_qty, disabled_symbols, tag)
+                        state['position'], actual_qty, disabled_symbols, tag,
+                        state=state)  # SL_SOFTWARE
+                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
@@ -881,7 +874,9 @@ def process_symbol(symbol, ctx):
                                     confidence=confidence, verdict=verdict)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, "BUY", sl_price,
-                        state['position'], actual_qty, disabled_symbols, tag)
+                        state['position'], actual_qty, disabled_symbols, tag,
+                        state=state)  # SL_SOFTWARE
+                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
@@ -900,10 +895,13 @@ def process_symbol(symbol, ctx):
             # Unrealized PnL (used for account protection + voluntary close gate)
             upnl_pct = (current_price - entry) / entry * state['position']
 
-            # SL / TP checks
+            # SL / TP checks — SL_SOFTWARE: prefer absolute sl_price from state,
+            # fallback to entry * (1 ± sl_pct) if sl_price not set yet  # SL_SOFTWARE
+            sl_price_state = state.get('sl_price', 0.0)  # SL_SOFTWARE
             if state['position'] == 1:
-                if current_price <= entry * (1 - sl_pct):
-                    log.info(f"{tag} 🛑 LONG SL @ ${current_price:,.2f}")
+                sl_trigger = sl_price_state if sl_price_state > 0 else entry * (1 - sl_pct)  # SL_SOFTWARE
+                if current_price <= sl_trigger:
+                    log.info(f"{tag} 🛑 LONG SL hit @ ${current_price:,.2f} (trigger ${sl_trigger:,.2f})")  # SL_SOFTWARE
                     force_close = True
                     close_reason = "SL"
                 elif current_price >= entry * (1 + tp_pct):
@@ -911,8 +909,9 @@ def process_symbol(symbol, ctx):
                     force_close = True
                     close_reason = "TP"
             elif state['position'] == -1:
-                if current_price >= entry * (1 + sl_pct):
-                    log.info(f"{tag} 🛑 SHORT SL @ ${current_price:,.2f}")
+                sl_trigger = sl_price_state if sl_price_state > 0 else entry * (1 + sl_pct)  # SL_SOFTWARE
+                if current_price >= sl_trigger:
+                    log.info(f"{tag} 🛑 SHORT SL hit @ ${current_price:,.2f} (trigger ${sl_trigger:,.2f})")  # SL_SOFTWARE
                     force_close = True
                     close_reason = "SL"
                 elif current_price <= entry * (1 - tp_pct):
@@ -951,7 +950,9 @@ def process_symbol(symbol, ctx):
                     be_price = round_price(entry, tick_size, price_prec)
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, be_side, be_price,
-                        state['position'], state['qty'], disabled_symbols, tag)
+                        state['position'], state['qty'], disabled_symbols, tag,
+                        state=state)  # SL_SOFTWARE
+                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
@@ -988,7 +989,9 @@ def process_symbol(symbol, ctx):
                         log.error(f"{tag} Failed to cancel open orders: {e}")
                     sl_ok = safe_place_sl_or_exit(
                         exec_client, symbol, trail_side, trail_sl_price,
-                        state['position'], state['qty'], disabled_symbols, tag)
+                        state['position'], state['qty'], disabled_symbols, tag,
+                        state=state)  # SL_SOFTWARE
+                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
                     if not sl_ok:
                         state['position'] = 0
                         state['entry_price'] = 0.0
@@ -1102,6 +1105,7 @@ def process_symbol(symbol, ctx):
                     state['entry_reasoning'] = ""
                     state['breakeven_set'] = False
                     state['trail_1r_set'] = False
+                    state['sl_price'] = 0.0  # SL_SOFTWARE: reset SL on close
                     save_state(state, state_path)
                 else:
                     # SAFETY FIX: close order placement itself failed — log critical
