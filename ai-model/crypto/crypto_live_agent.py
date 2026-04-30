@@ -30,13 +30,15 @@ from stable_baselines3 import PPO
 from crypto_env_v2 import CryptoMTFEnv, CryptoTechEnv  # NEW_MODEL: import 44-feature env
 from reasoning_engine import perceive, interpret, decide, get_dynamic_sl_tp, simulate_missed_trade
 from trade_memory import TradeMemory
+from sentiment_agent  import SentimentAgent
+from position_auditor import PositionAuditor
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SYMBOLS         = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TRADE_NOTIONAL  = 1500.0         # USDT notional per trade per symbol
 LEVERAGE        = 3              # 3× leverage
 FETCH_EVERY     = 60             # seconds between cycles (1 min)
-MAX_DAILY_TRADES = 6             # max NEW entries per UTC day PER SYMBOL (18 total across 3)
+MAX_DAILY_TRADES = 3             # max NEW entries per UTC day PER SYMBOL (was 6 — reduced to force selectivity)
 MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
 MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
 RISK_PER_TRADE_PCT = 0.01       # risk 1% of balance per trade
@@ -461,6 +463,79 @@ def get_sl_fill_price(client, symbol, tag=""):
     return None
 
 
+# ── Multi-agent orchestrator helpers ──────────────────────────────────────────
+
+def orchestrator_gate(symbol, action, conditions, perception, memory,
+                      state, narrative, ctx, log, tag):
+    """
+    Multi-agent orchestrated gate. Replaces the old single reasoning gate.
+    Returns (verdict, confidence, reasoning_text, tier, sentiment_signal, audit)
+    or None if we should skip this cycle.
+    """
+    sentiment_agent  = ctx.get('sentiment_agent')
+    position_auditor = ctx.get('position_auditor')
+
+    # ── Agent 1: Sentiment ───────────────────────────────────────────
+    sentiment_signal = None
+    if sentiment_agent:
+        try:
+            sentiment_signal = sentiment_agent.get_signal(symbol)
+        except Exception as e:
+            log.warning(f"{tag} Sentiment fetch failed: {e}")
+
+    # ── Agent 2: Reasoning Engine (fixed) ────────────────────────────
+    verdict, confidence, reasoning_text, tier = decide(
+        action, conditions, perception, memory, narrative,
+        sentiment_signal=sentiment_signal
+    )
+
+    log.info(f"\n{'='*55}\n{tag} {reasoning_text}\n{'='*55}")
+
+    # ── Agent 3: Position Auditor (only when in trade) ────────────────
+    if state.get('position', 0) != 0 and position_auditor:
+        try:
+            audit = position_auditor.audit(
+                state, conditions, perception, sentiment_signal
+            )
+            log.info(f"{tag} [AUDITOR] {audit['action']} | score={audit['score']:.2f} | {audit['reason']}")
+
+            if audit['action'] == 'EXIT_NOW':
+                log.warning(f"{tag} 🔍 AUDITOR EXIT_NOW: {audit['reason']}")
+                return ('AUDITOR_EXIT', confidence, reasoning_text, tier,
+                        sentiment_signal, audit)
+
+        except Exception as e:
+            log.error(f"{tag} Position auditor failed: {e}")
+
+    # ── Agent 4: Hard reject from reasoning engine ────────────────────
+    if verdict == 'HARD_REJECT':
+        sl_pct_rej, tp_pct_rej = _get_rejection_sl_tp(conditions, memory)
+        _store_rejection(state, action, conditions, ctx, sl_pct_rej, tp_pct_rej)
+        log.info(f"{tag} ⛔ HARD_REJECT — regime/session direction block")
+        return None   # skip cycle
+
+    # ── Standard reject ───────────────────────────────────────────────
+    if action in (1, 2) and verdict not in ("EXECUTE", "WEAK_EXECUTE"):
+        sl_pct_rej, tp_pct_rej = _get_rejection_sl_tp(conditions, memory)
+        _store_rejection(state, action, conditions, ctx, sl_pct_rej, tp_pct_rej)
+        log.info(f"{tag} ⛔ Trade REJECTED (confidence={confidence:.0%}) — stored for regret review")
+        return None   # skip cycle
+
+    return (verdict, confidence, reasoning_text, tier, sentiment_signal, None)
+
+
+def _get_rejection_sl_tp(conditions, memory):
+    return get_dynamic_sl_tp(conditions, memory)
+
+
+def _store_rejection(state, action, conditions, ctx, sl_pct, tp_pct):
+    """Store rejection in state for regret review."""
+    state['last_rejected_action']     = action
+    state['last_rejected_conditions'] = conditions
+    state['last_rejected_sl_pct']     = sl_pct
+    state['last_rejected_tp_pct']     = tp_pct
+
+
 # ── Per-symbol cycle logic ────────────────────────────────────────────────────
 
 def process_symbol(symbol, ctx):
@@ -713,21 +788,28 @@ def process_symbol(symbol, ctx):
         # ── Reasoning gate ───────────────────────────────────────────────────
         perception = perceive(df, state)
         conditions, narrative = interpret(perception)
-        verdict, confidence, reasoning_text, tier = decide(action, conditions, perception, memory, narrative)  # QUALITY TIER: unpack tier
-        log.info(f"\n{'='*55}\n{tag} {reasoning_text}\n{'='*55}")
 
-        if action in (1, 2) and verdict not in ("EXECUTE", "WEAK_EXECUTE"):
-            sl_pct_rej, tp_pct_rej = get_dynamic_sl_tp(conditions, memory)
-            state['last_rejected_action'] = action
-            state['last_rejected_conditions'] = conditions
-            state['last_rejected_bar_ts'] = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
-            state['last_rejected_sl_pct'] = sl_pct_rej
-            state['last_rejected_tp_pct'] = tp_pct_rej
-            save_state(state, state_path)
-            log.info(f"{tag} ⛔ Trade REJECTED — stored for regret review next bar")
+        result = orchestrator_gate(
+            symbol, action, conditions, perception, memory,
+            state, narrative, ctx, log, tag
+        )
+        if result is None:
+            if state.get('last_rejected_action') is not None:
+                state['last_rejected_bar_ts'] = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
+                save_state(state, state_path)
             wr = state['wins'] / max(1, state['wins'] + state['losses'])
             log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
             return
+
+        verdict, confidence, reasoning_text, tier, sentiment_signal, audit = result
+
+        # Handle auditor EXIT_NOW
+        if verdict == 'AUDITOR_EXIT':
+            action = 3
+            state['_auditor_exit'] = True
+            state['_auditor_reason'] = audit['reason'][:200]
+        else:
+            state.pop('_auditor_exit', None)
 
         # ── Daily trade limit gate (per symbol) ──────────────────────────────
         today = datetime.now(timezone.utc).date().isoformat()
@@ -891,6 +973,13 @@ def process_symbol(symbol, ctx):
             entry = state['entry_price']
             force_close = False
             close_reason = None
+
+            # Auditor exit takes priority over everything else
+            if state.get('_auditor_exit'):
+                force_close  = True
+                close_reason = f"AUDITOR: {state.get('_auditor_reason', 'thesis broken')}"
+                state.pop('_auditor_exit', None)
+                state.pop('_auditor_reason', None)
 
             # Unrealized PnL (used for account protection + voluntary close gate)
             upnl_pct = (current_price - entry) / entry * state['position']
@@ -1113,10 +1202,34 @@ def process_symbol(symbol, ctx):
                                  f"exchange SL should protect")
 
         wr = state['wins'] / max(1, state['wins'] + state['losses'])
-        log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
+        sentiment_agent = ctx.get('sentiment_agent')
+        if sentiment_agent:
+            try:
+                sig = sentiment_agent.get_signal(symbol)
+                log.info(
+                    f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | "
+                    f"PnL: ${state['total_pnl_usdt']:+.2f} | "
+                    f"Sentiment: {sig['direction']} ({sig['strength']:.0%}) | "
+                    f"F&G: {sig['fear_greed_label']}({sig['fear_greed_value']})"
+                )
+            except Exception:
+                log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
+        else:
+            log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
 
     except Exception as e:
         log.error(f"{tag} ❌ Cycle error: {e}", exc_info=True)
+
+
+# ── Agent initialization ──────────────────────────────────────────────────────
+
+def init_agents(exec_client):
+    """Initialize the multi-agent system."""
+    sentiment_agent  = SentimentAgent(binance_client=exec_client)
+    position_auditor = PositionAuditor()
+    log.info("✅ SentimentAgent initialized (CryptoCompare + CoinGecko + Yahoo + F&G + Binance)")
+    log.info("✅ PositionAuditor initialized")
+    return sentiment_agent, position_auditor
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1182,6 +1295,8 @@ def main():
     model = PPO.load(MODEL_PATH)
     log.info(f"✅ Model loaded: {MODEL_PATH}")
 
+    sentiment_agent, position_auditor = init_agents(exec_client)
+
     # Per-symbol memories, states, and filters
     memories = {}
     states = {}
@@ -1228,6 +1343,8 @@ def main():
         'last_bar_times': last_bar_times,
         'max_loss_per_trade': max_loss_per_trade,
         'disabled_symbols': disabled_symbols,
+        'sentiment_agent':  sentiment_agent,
+        'position_auditor': position_auditor,
     }
 
     while True:
