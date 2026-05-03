@@ -572,15 +572,28 @@ def process_symbol(symbol, ctx):
             return
 
         latest_bar_time = df['Datetime'].iloc[-2]
-        if latest_bar_time == ctx['last_bar_times'][symbol]:
-            return  # no new bar for this symbol
+        new_bar = latest_bar_time != ctx['last_bar_times'][symbol]
 
-        ctx['last_bar_times'][symbol] = latest_bar_time
-        current_price = float(df['close'].iloc[-2])
-        log.info(f"\n{tag} 📊 New bar: {latest_bar_time} | Close: ${current_price:,.2f}")
+        # SL_SOFTWARE: fetch live mark price every cycle so SL/TP/protection
+        # checks react to real-time moves, not just 1H bar closes.
+        try:
+            mark_price = float(data_client.futures_mark_price(symbol=symbol)['markPrice'])
+        except Exception as _mpe:
+            mark_price = float(df['close'].iloc[-2])
+            log.warning(f"{tag} mark_price fetch failed ({_mpe}) — falling back to bar close ${mark_price:,.2f}")
+        current_price = mark_price  # used for SL/TP/protection + entry sizing
 
-        # ── Regret review ────────────────────────────────────────────────────
-        if (state.get('last_rejected_action') is not None and state.get('position') == 0):
+        # Nothing to manage when no new bar AND no open position
+        if not new_bar and state.get('position', 0) == 0:
+            return
+
+        if new_bar:
+            ctx['last_bar_times'][symbol] = latest_bar_time
+            bar_close = float(df['close'].iloc[-2])
+            log.info(f"\n{tag} 📊 New bar: {latest_bar_time} | Close: ${bar_close:,.2f} | Mark: ${mark_price:,.2f}")
+
+        # ── Regret review (BAR-GATED — uses df indexing) ─────────────────────
+        if new_bar and (state.get('last_rejected_action') is not None and state.get('position') == 0):
             try:
                 rejected_ts = state.get('last_rejected_bar_ts')
                 rejected_action = state['last_rejected_action']
@@ -700,7 +713,9 @@ def process_symbol(symbol, ctx):
                         log.warning(f"{tag} ⚠️  Exchange entryPrice is {exchange_entry_price} "
                                     f"— using current_price ${current_price:,.2f} as fallback")
                     state['entry_price'] = exchange_entry_price if exchange_entry_price > 0 else current_price
-                    state['entry_time'] = datetime.now(timezone.utc).isoformat()
+                    if not state.get('entry_time'):
+                        state['entry_time'] = datetime.now(timezone.utc).isoformat()
+                        log.warning(f"{tag} entry_time missing after state rebuild — set to now (conservative)")
                     state['breakeven_set'] = False
                     state['trail_1r_set'] = False
                     state['sl_price'] = 0.0  # SL_SOFTWARE: rebuild SL fresh below
@@ -755,73 +770,90 @@ def process_symbol(symbol, ctx):
         except Exception as e:
             log.error(f"{tag} ❌ Position reconcile failed: {e}")
 
-        # ── Build observation ────────────────────────────────────────────────
-        env = CryptoTechEnv(df.iloc[:-1].reset_index(drop=True))  # NEW_MODEL: 44-feature env
-        env.reset()
-        obs = env._get_obs(len(df) - 2)
+        # ── Bar-gated decisions: model + reasoning + entry sizing ───────────
+        # On no-new-bar cycles these are skipped; only position-management
+        # below runs (so SL/TP can react to live mark price every minute).
+        action = None
+        entries_allowed = False
+        verdict = None
+        confidence = 0.5
+        reasoning_text = ""
+        tier = None
+        sentiment_signal = None
+        audit = None
+        conditions = None
+        narrative = None
+        trade_notional = TRADE_NOTIONAL
+        trade_id = None
 
-        in_trade = 1.0 if state['position'] != 0 else 0.0
-        direction = float(state['position'])
-        if state['position'] != 0 and state['entry_price'] > 0:
-            upnl = (current_price - state['entry_price']) / state['entry_price'] * state['position']
-            upnl_norm = float(np.clip(upnl * 10, -1, 1))
-        else:
-            upnl_norm = 0.0
-        if state['entry_time']:
-            entry_dt = datetime.fromisoformat(state['entry_time'])
-            bars_held = int((datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600)
-            bars_norm = float(np.clip(bars_held / 48, 0, 1))
-        else:
-            bars_norm = 0.0
+        if new_bar:
+            # ── Build observation ────────────────────────────────────────────
+            env = CryptoTechEnv(df.iloc[:-1].reset_index(drop=True))  # NEW_MODEL: 44-feature env
+            env.reset()
+            obs = env._get_obs(len(df) - 2)
 
-        obs[27] = in_trade
-        obs[28] = direction
-        obs[29] = upnl_norm
-        obs[30] = bars_norm
+            in_trade = 1.0 if state['position'] != 0 else 0.0
+            direction = float(state['position'])
+            if state['position'] != 0 and state['entry_price'] > 0:
+                upnl = (current_price - state['entry_price']) / state['entry_price'] * state['position']
+                upnl_norm = float(np.clip(upnl * 10, -1, 1))
+            else:
+                upnl_norm = 0.0
+            if state['entry_time']:
+                entry_dt = datetime.fromisoformat(state['entry_time'])
+                bars_held = int((datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600)
+                bars_norm = float(np.clip(bars_held / 48, 0, 1))
+            else:
+                bars_norm = 0.0
 
-        # ── Model decision ───────────────────────────────────────────────────
-        action, _ = model.predict(obs, deterministic=True)
-        action = int(action)
-        action_names = {0: "HOLD", 1: "BUY (long)", 2: "SELL (short)", 3: "CLOSE"}
-        log.info(f"{tag} 🤖 Decision: {action_names[action]} | Position: {state['position']}")
+            obs[27] = in_trade
+            obs[28] = direction
+            obs[29] = upnl_norm
+            obs[30] = bars_norm
 
-        # ── Reasoning gate ───────────────────────────────────────────────────
-        perception = perceive(df, state)
-        conditions, narrative = interpret(perception)
+            # ── Model decision ───────────────────────────────────────────────
+            action, _ = model.predict(obs, deterministic=True)
+            action = int(action)
+            action_names = {0: "HOLD", 1: "BUY (long)", 2: "SELL (short)", 3: "CLOSE"}
+            log.info(f"{tag} 🤖 Decision: {action_names[action]} | Position: {state['position']}")
 
-        result = orchestrator_gate(
-            symbol, action, conditions, perception, memory,
-            state, narrative, ctx, log, tag
-        )
-        if result is None:
-            if state.get('last_rejected_action') is not None:
-                state['last_rejected_bar_ts'] = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
-                save_state(state, state_path)
-            wr = state['wins'] / max(1, state['wins'] + state['losses'])
-            log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
-            return
+            # ── Reasoning gate ───────────────────────────────────────────────
+            perception = perceive(df, state)
+            conditions, narrative = interpret(perception)
 
-        verdict, confidence, reasoning_text, tier, sentiment_signal, audit = result
+            result = orchestrator_gate(
+                symbol, action, conditions, perception, memory,
+                state, narrative, ctx, log, tag
+            )
+            if result is None:
+                if state.get('last_rejected_action') is not None:
+                    state['last_rejected_bar_ts'] = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
+                    save_state(state, state_path)
+                wr = state['wins'] / max(1, state['wins'] + state['losses'])
+                log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
+                return
 
-        # Handle auditor EXIT_NOW
-        if verdict == 'AUDITOR_EXIT':
-            action = 3
-            state['_auditor_exit'] = True
-            state['_auditor_reason'] = audit['reason'][:200]
-        else:
-            state.pop('_auditor_exit', None)
+            verdict, confidence, reasoning_text, tier, sentiment_signal, audit = result
 
-        # ── Daily trade limit gate (per symbol) ──────────────────────────────
-        today = datetime.now(timezone.utc).date().isoformat()
-        if state.get('last_trade_date') != today:
-            state['daily_trades'] = 0
-            state['last_trade_date'] = today
-        entries_allowed = state['daily_trades'] < MAX_DAILY_TRADES
-        if not entries_allowed and state['position'] == 0 and action in (1, 2):
-            log.warning(f"{tag} ⏸️  Daily trade limit reached ({state['daily_trades']}/{MAX_DAILY_TRADES}) — skip entry")
+            # Handle auditor EXIT_NOW
+            if verdict == 'AUDITOR_EXIT':
+                action = 3
+                state['_auditor_exit'] = True
+                state['_auditor_reason'] = audit['reason'][:200]
+            else:
+                state.pop('_auditor_exit', None)
+
+            # ── Daily trade limit gate (per symbol) ──────────────────────────
+            today = datetime.now(timezone.utc).date().isoformat()
+            if state.get('last_trade_date') != today:
+                state['daily_trades'] = 0
+                state['last_trade_date'] = today
+            entries_allowed = state['daily_trades'] < MAX_DAILY_TRADES
+            if not entries_allowed and state['position'] == 0 and action in (1, 2):
+                log.warning(f"{tag} ⏸️  Daily trade limit reached ({state['daily_trades']}/{MAX_DAILY_TRADES}) — skip entry")
 
         # ── Execute ──────────────────────────────────────────────────────────
-        if state['position'] == 0 and entries_allowed:
+        if new_bar and state['position'] == 0 and entries_allowed:
             if action in (1, 2):
                 # ── Idempotency: duplicate order protection ──────────────
                 bar_ts_str = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
@@ -1106,7 +1138,8 @@ def process_symbol(symbol, ctx):
             # Blocked if profit < 50% TP (let breakeven/trail handle it).
             # Allowed if in loss (cut losses) OR past 50% TP (profit already secured).
             allow_voluntary_close = False
-            if action == 3 and not force_close:
+            # Voluntary close requires a fresh model decision — only on new bars
+            if new_bar and action == 3 and not force_close:
                 half_tp = tp_pct * 0.5
                 if upnl_pct < 0:
                     allow_voluntary_close = True
@@ -1214,21 +1247,23 @@ def process_symbol(symbol, ctx):
                     log.critical(f"{tag} EXIT order placement FAILED — position still open, "
                                  f"exchange SL should protect")
 
-        wr = state['wins'] / max(1, state['wins'] + state['losses'])
-        sentiment_agent = ctx.get('sentiment_agent')
-        if sentiment_agent:
-            try:
-                sig = sentiment_agent.get_signal(symbol)
-                log.info(
-                    f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | "
-                    f"PnL: ${state['total_pnl_usdt']:+.2f} | "
-                    f"Sentiment: {sig['direction']} ({sig['strength']:.0%}) | "
-                    f"F&G: {sig['fear_greed_label']}({sig['fear_greed_value']})"
-                )
-            except Exception:
+        # Per-bar summary (skipped on intra-bar SL-monitoring cycles)
+        if new_bar:
+            wr = state['wins'] / max(1, state['wins'] + state['losses'])
+            sentiment_agent = ctx.get('sentiment_agent')
+            if sentiment_agent:
+                try:
+                    sig = sentiment_agent.get_signal(symbol)
+                    log.info(
+                        f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | "
+                        f"PnL: ${state['total_pnl_usdt']:+.2f} | "
+                        f"Sentiment: {sig['direction']} ({sig['strength']:.0%}) | "
+                        f"F&G: {sig['fear_greed_label']}({sig['fear_greed_value']})"
+                    )
+                except Exception:
+                    log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
+            else:
                 log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
-        else:
-            log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
 
     except Exception as e:
         log.error(f"{tag} ❌ Cycle error: {e}", exc_info=True)
