@@ -23,7 +23,7 @@ import logging
 import json
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from stable_baselines3 import PPO
@@ -136,6 +136,8 @@ DEFAULT_STATE = {
     "trail_1r_set": False,
     "consecutive_losses": 0,
     "last_trade_id": None,
+    "pending_signal": None,        # 1H-approved signal awaiting 15m confirmation
+    "last_15m_check": None,        # ISO timestamp of last 15m confirmation check
 }
 
 def load_state(state_path):
@@ -536,6 +538,227 @@ def _store_rejection(state, action, conditions, ctx, sl_pct, tp_pct):
     state['last_rejected_tp_pct']     = tp_pct
 
 
+def _execute_entry(symbol, ctx, state, current_price, filters, tag, memory,
+                   action, verdict, confidence, tier, conditions,
+                   reasoning_text, signal_bar_ts):
+    """
+    Place an entry order for an approved signal. Used by both:
+      - Direct 1H bar entries (legacy path)
+      - 15m confirmation entries (new path)
+    Returns True iff an entry was placed and confirmed filled.
+    Mutates `state` and persists it.
+    """
+    exec_client      = ctx['exec_client']
+    disabled_symbols = ctx['disabled_symbols']
+    state_path       = state_path_for(symbol)
+
+    step_size  = filters['step_size']
+    min_qty    = filters['min_qty']
+    qty_prec   = filters['qty_prec']
+    tick_size  = filters['tick_size']
+    price_prec = filters['price_prec']
+
+    # Daily trade limit (per symbol, UTC day)
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get('last_trade_date') != today:
+        state['daily_trades'] = 0
+        state['last_trade_date'] = today
+    if state['daily_trades'] >= MAX_DAILY_TRADES:
+        log.warning(f"{tag} ⏸️  Daily trade limit reached "
+                    f"({state['daily_trades']}/{MAX_DAILY_TRADES}) — skip entry")
+        return False
+
+    # Idempotency: never re-enter on the same originating signal bar
+    trade_id = f"{symbol}_{signal_bar_ts}"
+    if trade_id == state.get('last_trade_id'):
+        log.warning(f"{tag} Duplicate signal — trade_id={trade_id} — skipping")
+        return False
+
+    # Exposure cap from exchange
+    open_count = count_exchange_open_positions(exec_client, SYMBOLS)
+    if open_count >= MAX_CONCURRENT_POSITIONS:
+        log.warning(f"{tag} Exposure limit: {open_count}/{MAX_CONCURRENT_POSITIONS} "
+                    f"exchange positions open — blocking new entry")
+        return False
+
+    sl_pct, tp_pct = get_dynamic_sl_tp(conditions, memory)
+
+    # Risk-based sizing
+    pre_trade_balance = fetch_live_balance(exec_client)
+    if pre_trade_balance is None or pre_trade_balance <= 0:
+        log.error(f"{tag} Balance fetch returned {pre_trade_balance} — aborting entry")
+        return False
+    risk_per_trade = pre_trade_balance * RISK_PER_TRADE_PCT
+    risk_notional  = risk_per_trade / max(sl_pct, 0.001)
+    trade_notional = min(risk_notional, TRADE_NOTIONAL,
+                         pre_trade_balance * LEVERAGE * 0.30)
+    if trade_notional / max(current_price, 1) < min_qty:
+        log.warning(f"{tag} Risk-sized notional ${trade_notional:.2f} too small "
+                    f"for min_qty={min_qty} — skipping entry")
+        return False
+
+    # Tier sizing
+    tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'TRASH': 0.0}
+    tier_mult = tier_multipliers.get(tier, 0.0)
+    if tier == 'TRASH':
+        log.warning(f"{tag} ⛔ TRASH tier — skipping entry")
+        return False
+    trade_notional = trade_notional * tier_mult
+    if trade_notional / max(current_price, 1) < min_qty:
+        log.warning(f"{tag} Tier-scaled notional ${trade_notional:.2f} too small "
+                    f"for min_qty={min_qty} — skipping entry")
+        return False
+
+    log.info(f"{tag} 📐 Risk sizing: balance=${pre_trade_balance:,.2f} | "
+             f"1% risk=${risk_per_trade:.2f} | SL={sl_pct:.1%} | "
+             f"raw_notional=${risk_notional:,.2f} | "
+             f"capped=${trade_notional:,.2f} | TP={tp_pct:.1%} | "
+             f"WR={memory.get_win_rate(conditions)} | "
+             f"Tier={tier} ({tier_mult:.0%})")
+
+    if action == 1:  # LONG
+        order, qty = open_long(exec_client, symbol, trade_notional, current_price,
+                               step_size, min_qty, qty_prec)
+        if not order:
+            return False
+        filled, avg_price, exec_qty = confirm_order_fill(
+            exec_client, symbol, order, requested_qty=qty, tag=tag)
+        if not filled:
+            log.critical(f"{tag} LONG order NOT confirmed filled — state NOT updated")
+            return False
+        actual_qty   = exec_qty if exec_qty > 0 else qty
+        actual_price = avg_price if avg_price > 0 else current_price
+
+        state['position']         = 1
+        state['entry_price']      = actual_price
+        state['entry_time']       = datetime.now(timezone.utc).isoformat()
+        state['qty']              = actual_qty
+        state['trade_count']     += 1
+        state['daily_trades']    += 1
+        state['sl_pct']           = sl_pct
+        state['tp_pct']           = tp_pct
+        state['entry_conditions'] = conditions
+        state['entry_confidence'] = confidence
+        state['entry_verdict']    = verdict
+        state['entry_reasoning']  = (reasoning_text or "")[:300]
+        state['last_trade_id']    = trade_id
+        state['breakeven_set']    = False
+        state['trail_1r_set']     = False
+        save_state(state, state_path)
+        log.info(f"{tag} 📈 LONG opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
+        sl_price = round_price(actual_price * (1 - sl_pct), tick_size, price_prec)
+        log_trade_event(symbol, "OPEN", "LONG", actual_qty, actual_price,
+                        trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
+                        confidence=confidence, verdict=verdict)
+        sl_ok = safe_place_sl_or_exit(
+            exec_client, symbol, "SELL", sl_price,
+            state['position'], actual_qty, disabled_symbols, tag, state=state)
+        save_state(state, state_path)
+        if not sl_ok:
+            state['position']    = 0
+            state['entry_price'] = 0.0
+            state['entry_time']  = None
+            state['qty']         = 0.0
+            save_state(state, state_path)
+            return False
+        return True
+
+    if action == 2:  # SHORT
+        order, qty = open_short(exec_client, symbol, trade_notional, current_price,
+                                step_size, min_qty, qty_prec)
+        if not order:
+            return False
+        filled, avg_price, exec_qty = confirm_order_fill(
+            exec_client, symbol, order, requested_qty=qty, tag=tag)
+        if not filled:
+            log.critical(f"{tag} SHORT order NOT confirmed filled — state NOT updated")
+            return False
+        actual_qty   = exec_qty if exec_qty > 0 else qty
+        actual_price = avg_price if avg_price > 0 else current_price
+
+        state['position']         = -1
+        state['entry_price']      = actual_price
+        state['entry_time']       = datetime.now(timezone.utc).isoformat()
+        state['qty']              = actual_qty
+        state['trade_count']     += 1
+        state['daily_trades']    += 1
+        state['sl_pct']           = sl_pct
+        state['tp_pct']           = tp_pct
+        state['entry_conditions'] = conditions
+        state['entry_confidence'] = confidence
+        state['entry_verdict']    = verdict
+        state['entry_reasoning']  = (reasoning_text or "")[:300]
+        state['last_trade_id']    = trade_id
+        state['breakeven_set']    = False
+        state['trail_1r_set']     = False
+        save_state(state, state_path)
+        log.info(f"{tag} 📉 SHORT opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
+        sl_price = round_price(actual_price * (1 + sl_pct), tick_size, price_prec)
+        log_trade_event(symbol, "OPEN", "SHORT", actual_qty, actual_price,
+                        trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
+                        confidence=confidence, verdict=verdict)
+        sl_ok = safe_place_sl_or_exit(
+            exec_client, symbol, "BUY", sl_price,
+            state['position'], actual_qty, disabled_symbols, tag, state=state)
+        save_state(state, state_path)
+        if not sl_ok:
+            state['position']    = 0
+            state['entry_price'] = 0.0
+            state['entry_time']  = None
+            state['qty']         = 0.0
+            save_state(state, state_path)
+            return False
+        return True
+
+    return False
+
+
+def fetch_15m_df(client, symbol, limit=20):
+    """Fetch the last `limit` 15m futures candles as a DataFrame with float OHLC."""
+    klines = client.futures_klines(symbol=symbol, interval='15m', limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'ts','open','high','low','close','volume',
+        'close_time','qav','trades','tbbav','tbqav','ignore'
+    ])
+    for col in ['open','high','low','close','volume']:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def check_15m_confirmation(df_15m, action):
+    """
+    Validate a 1H-approved signal against the 15m timeframe.
+    Returns (ok: bool, reason: str).
+      a) 15m trend aligns with signal direction (last 3 closed bars in direction)
+      b) 15m momentum not exhausted (live bar move from open <= 1%)
+      c) caller is responsible for the 'no open position' check
+    """
+    if len(df_15m) < 4:
+        return False, f"not enough 15m bars ({len(df_15m)})"
+
+    closes = df_15m['close'].values
+    # last 3 closed bars (index -4..-2 are closed, -1 is the live in-progress bar)
+    c3, c2, c1 = float(closes[-4]), float(closes[-3]), float(closes[-2])
+
+    if action == 1:  # LONG
+        if not (c3 < c2 < c1):
+            return False, f"15m closes not ascending: {c3:.2f} → {c2:.2f} → {c1:.2f}"
+    elif action == 2:  # SHORT
+        if not (c3 > c2 > c1):
+            return False, f"15m closes not descending: {c3:.2f} → {c2:.2f} → {c1:.2f}"
+    else:
+        return False, f"unsupported action {action}"
+
+    # Momentum-exhaustion guard on the live (in-progress) 15m bar
+    live_open = float(df_15m['open'].iloc[-1])
+    live_close = float(df_15m['close'].iloc[-1])
+    move_pct = abs(live_close - live_open) / max(live_open, 1e-9)
+    if move_pct > 0.01:
+        return False, f"15m momentum exhausted: {move_pct:.2%} from open"
+
+    return True, f"trend aligned + momentum healthy ({move_pct:.2%} from 15m open)"
+
+
 # ── Per-symbol cycle logic ────────────────────────────────────────────────────
 
 def process_symbol(symbol, ctx):
@@ -852,154 +1075,83 @@ def process_symbol(symbol, ctx):
             if not entries_allowed and state['position'] == 0 and action in (1, 2):
                 log.warning(f"{tag} ⏸️  Daily trade limit reached ({state['daily_trades']}/{MAX_DAILY_TRADES}) — skip entry")
 
-        # ── Execute ──────────────────────────────────────────────────────────
-        if new_bar and state['position'] == 0 and entries_allowed:
-            if action in (1, 2):
-                # ── Idempotency: duplicate order protection ──────────────
-                bar_ts_str = latest_bar_time.isoformat() if hasattr(latest_bar_time, 'isoformat') else str(latest_bar_time)
-                trade_id = f"{symbol}_{bar_ts_str}"
-                if trade_id == state.get('last_trade_id'):
-                    log.warning(f"{tag} Duplicate signal on same bar — trade_id={trade_id} — skipping")
-                    return
+        # ── 1H signal storage: approve into pending_signal, defer execution ──
+        # Actual entry is gated by the 15m confirmation block below.
+        if new_bar and state['position'] == 0 and entries_allowed and action in (1, 2):
+            if verdict in ('EXECUTE', 'WEAK_EXECUTE'):
+                bar_ts_str = (latest_bar_time.isoformat()
+                              if hasattr(latest_bar_time, 'isoformat')
+                              else str(latest_bar_time))
+                state['pending_signal'] = {
+                    'action':         int(action),
+                    'verdict':        verdict,
+                    'confidence':     float(confidence),
+                    'tier':           tier,
+                    'bar_ts':         bar_ts_str,
+                    'expires_at':     (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                    'conditions':     conditions,
+                    'reasoning_text': (reasoning_text or "")[:300],
+                }
+                # Reset the 15m timer so the first check fires on the next cycle
+                state['last_15m_check'] = None
+                save_state(state, state_path)
+                log.info(f"{tag} 🕒 1H signal approved (action={action}, verdict={verdict}, "
+                         f"conf={confidence:.0%}, tier={tier}) — pending 15m confirmation, "
+                         f"expires in 1h")
 
-                # SAFETY FIX: use exchange positions for exposure limit, not local state
-                open_count = count_exchange_open_positions(exec_client, SYMBOLS)
-                if open_count >= MAX_CONCURRENT_POSITIONS:
-                    log.warning(f"{tag} Exposure limit: {open_count}/{MAX_CONCURRENT_POSITIONS} "
-                                f"exchange positions open — blocking new entry")
-                    return
+        # ── 15m entry confirmation: every 15+ min, check pending signal ─────
+        if state['position'] == 0 and state.get('pending_signal'):
+            pending = state['pending_signal']
+            now = datetime.now(timezone.utc)
 
-                sl_pct, tp_pct = get_dynamic_sl_tp(conditions, memory)
+            try:
+                expires_at = datetime.fromisoformat(pending['expires_at'])
+            except Exception:
+                expires_at = now  # treat malformed as expired
 
-                # ── Risk-based position sizing ───────────────────────────
-                pre_trade_balance = fetch_live_balance(exec_client)
-                # SAFETY FIX: handle None from fetch_live_balance
-                if pre_trade_balance is None or pre_trade_balance <= 0:
-                    log.error(f"{tag} Balance fetch returned {pre_trade_balance} — aborting entry")
-                    return
-                risk_per_trade = pre_trade_balance * RISK_PER_TRADE_PCT
-                risk_notional = risk_per_trade / max(sl_pct, 0.001)
-                trade_notional = min(risk_notional, TRADE_NOTIONAL,
-                                     pre_trade_balance * LEVERAGE * 0.30)
-                # Floor check: enough to buy min_qty?
-                if trade_notional / max(current_price, 1) < min_qty:
-                    log.warning(f"{tag} Risk-sized notional ${trade_notional:.2f} too small "
-                                f"for min_qty={min_qty} — skipping entry")
-                    return
-                # QUALITY TIER: apply tier-based position sizing
-                tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'TRASH': 0.0}  # QUALITY TIER
-                tier_mult = tier_multipliers.get(tier, 0.0)  # QUALITY TIER
-                if tier == 'TRASH':  # QUALITY TIER
-                    log.warning(f"{tag} ⛔ TRASH tier — skipping entry")  # QUALITY TIER
-                    return  # QUALITY TIER
-                trade_notional = trade_notional * tier_mult  # QUALITY TIER
-                # Floor check again after tier scaling  # QUALITY TIER
-                if trade_notional / max(current_price, 1) < min_qty:  # QUALITY TIER
-                    log.warning(f"{tag} Tier-scaled notional ${trade_notional:.2f} too small "  # QUALITY TIER
-                                f"for min_qty={min_qty} — skipping entry")  # QUALITY TIER
-                    return  # QUALITY TIER
-                log.info(f"{tag} 📐 Risk sizing: balance=${pre_trade_balance:,.2f} | "
-                         f"1% risk=${risk_per_trade:.2f} | SL={sl_pct:.1%} | "
-                         f"raw_notional=${risk_notional:,.2f} | "
-                         f"capped=${trade_notional:,.2f} | TP={tp_pct:.1%} | "
-                         f"WR={memory.get_win_rate(conditions)} | "
-                         f"Tier={tier} ({tier_mult:.0%})")  # QUALITY TIER
+            if now >= expires_at:
+                log.info(f"{tag} ⏰ Pending 1H signal expired without 15m confirmation — clearing")
+                state['pending_signal'] = None
+                save_state(state, state_path)
+            else:
+                last_15m_str = state.get('last_15m_check')
+                last_15m_dt = None
+                if last_15m_str:
+                    try:
+                        last_15m_dt = datetime.fromisoformat(last_15m_str)
+                    except Exception:
+                        last_15m_dt = None
+                elapsed_min = ((now - last_15m_dt).total_seconds() / 60.0
+                               if last_15m_dt else float('inf'))
 
-            if action == 1:  # LONG
-                order, qty = open_long(exec_client, symbol, trade_notional, current_price,
-                                       step_size, min_qty, qty_prec)
-                if order:
-                    # ── Confirm fill before updating state ───────────────
-                    filled, avg_price, exec_qty = confirm_order_fill(
-                        exec_client, symbol, order, requested_qty=qty, tag=tag)
-                    if not filled:
-                        log.critical(f"{tag} LONG order NOT confirmed filled — state NOT updated")
-                        return
-                    actual_qty = exec_qty if exec_qty > 0 else qty
-                    actual_price = avg_price if avg_price > 0 else current_price
-
-                    state['position'] = 1
-                    state['entry_price'] = actual_price
-                    state['entry_time'] = datetime.now(timezone.utc).isoformat()
-                    state['qty'] = actual_qty
-                    state['trade_count'] += 1
-                    state['daily_trades'] += 1
-                    state['sl_pct'] = sl_pct
-                    state['tp_pct'] = tp_pct
-                    state['entry_conditions'] = conditions
-                    state['entry_confidence'] = confidence
-                    state['entry_verdict'] = verdict
-                    state['entry_reasoning'] = reasoning_text[:300]
-                    state['last_trade_id'] = trade_id
-                    state['breakeven_set'] = False   # SAFETY FIX: ensure clean on new entry
-                    state['trail_1r_set'] = False     # SAFETY FIX: ensure clean on new entry
+                if elapsed_min >= 15:
+                    state['last_15m_check'] = now.isoformat()
                     save_state(state, state_path)
-                    log.info(f"{tag} 📈 LONG opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
-                    sl_price = round_price(actual_price * (1 - sl_pct), tick_size, price_prec)
-                    log_trade_event(symbol, "OPEN", "LONG", actual_qty, actual_price,
-                                    trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
-                                    confidence=confidence, verdict=verdict)
-                    sl_ok = safe_place_sl_or_exit(
-                        exec_client, symbol, "SELL", sl_price,
-                        state['position'], actual_qty, disabled_symbols, tag,
-                        state=state)  # SL_SOFTWARE
-                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
-                    if not sl_ok:
-                        state['position'] = 0
-                        state['entry_price'] = 0.0
-                        state['entry_time'] = None
-                        state['qty'] = 0.0
-                        save_state(state, state_path)
-                        return
+                    try:
+                        df_15m = fetch_15m_df(data_client, symbol, limit=20)
+                        ok, why = check_15m_confirmation(df_15m, int(pending['action']))
+                        if ok:
+                            log.info(f"{tag} ✅ 15m confirmation OK: {why}")
+                            placed = _execute_entry(
+                                symbol, ctx, state, current_price, filters, tag, memory,
+                                action=int(pending['action']),
+                                verdict=pending['verdict'],
+                                confidence=float(pending['confidence']),
+                                tier=pending['tier'],
+                                conditions=pending['conditions'],
+                                reasoning_text=pending.get('reasoning_text', ''),
+                                signal_bar_ts=pending['bar_ts'],
+                            )
+                            if placed:
+                                state['pending_signal'] = None
+                                save_state(state, state_path)
+                        else:
+                            log.info(f"{tag} ⏳ 15m check failed: {why} — retry in 15m")
+                    except Exception as e:
+                        log.error(f"{tag} 15m confirmation block failed: {e}")
 
-            elif action == 2:  # SHORT
-                order, qty = open_short(exec_client, symbol, trade_notional, current_price,
-                                        step_size, min_qty, qty_prec)
-                if order:
-                    # ── Confirm fill before updating state ───────────────
-                    filled, avg_price, exec_qty = confirm_order_fill(
-                        exec_client, symbol, order, requested_qty=qty, tag=tag)
-                    if not filled:
-                        log.critical(f"{tag} SHORT order NOT confirmed filled — state NOT updated")
-                        return
-                    actual_qty = exec_qty if exec_qty > 0 else qty
-                    actual_price = avg_price if avg_price > 0 else current_price
-
-                    state['position'] = -1
-                    state['entry_price'] = actual_price
-                    state['entry_time'] = datetime.now(timezone.utc).isoformat()
-                    state['qty'] = actual_qty
-                    state['trade_count'] += 1
-                    state['daily_trades'] += 1
-                    state['sl_pct'] = sl_pct
-                    state['tp_pct'] = tp_pct
-                    state['entry_conditions'] = conditions
-                    state['entry_confidence'] = confidence
-                    state['entry_verdict'] = verdict
-                    state['entry_reasoning'] = reasoning_text[:300]
-                    state['last_trade_id'] = trade_id
-                    state['breakeven_set'] = False   # SAFETY FIX: ensure clean on new entry
-                    state['trail_1r_set'] = False     # SAFETY FIX: ensure clean on new entry
-                    save_state(state, state_path)
-                    log.info(f"{tag} 📉 SHORT opened | qty={actual_qty} @ avg=${actual_price:,.2f}")
-                    sl_price = round_price(actual_price * (1 + sl_pct), tick_size, price_prec)
-                    log_trade_event(symbol, "OPEN", "SHORT", actual_qty, actual_price,
-                                    trade_id=trade_id, sl_price=sl_price, tp_pct=tp_pct,
-                                    confidence=confidence, verdict=verdict)
-                    sl_ok = safe_place_sl_or_exit(
-                        exec_client, symbol, "BUY", sl_price,
-                        state['position'], actual_qty, disabled_symbols, tag,
-                        state=state)  # SL_SOFTWARE
-                    save_state(state, state_path)  # SL_SOFTWARE: persist sl_price
-                    if not sl_ok:
-                        state['position'] = 0
-                        state['entry_price'] = 0.0
-                        state['entry_time'] = None
-                        state['qty'] = 0.0
-                        save_state(state, state_path)
-                        return
-
-        elif state['position'] != 0:  # in a position
+        # ── Position management ──────────────────────────────────────────────
+        if state['position'] != 0:  # in a position
             sl_pct = state.get('sl_pct', 0.015)
             tp_pct = state.get('tp_pct', 0.04)
             entry = state['entry_price']
