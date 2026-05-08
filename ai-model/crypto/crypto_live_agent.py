@@ -35,13 +35,19 @@ from position_auditor import PositionAuditor
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SYMBOLS         = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-TRADE_NOTIONAL  = 3000.0         # USDT notional per trade per symbol
+TRADE_NOTIONAL  = 7000.0         # USDT notional cap per trade per symbol
 LEVERAGE        = 5              # 5× leverage
 FETCH_EVERY     = 60             # seconds between cycles (1 min)
 MAX_DAILY_TRADES = 3             # max NEW entries per UTC day PER SYMBOL
 MAX_CONSECUTIVE_LOSSES = 3       # disable symbol after N consecutive losses
 MAX_CONCURRENT_POSITIONS = 2     # max symbols open simultaneously (correlation risk)
-RISK_PER_TRADE_PCT = 0.01       # risk 1% of balance per trade
+RISK_PER_TRADE_BY_TIER = {
+    'A_PLUS': 0.020,  # 2.0% — high conviction → ~$100 risk on $5000
+    'A':      0.020,  # 2.0% — high conviction → ~$100 risk on $5000
+    'B':      0.010,  # 1.0% — medium conviction → ~$50 risk
+    'C':      0.005,  # 0.5% — marginal/WEAK_EXECUTE → ~$25 risk
+    'TRASH':  0.000,  # don't trade
+}
 KILL_SWITCH_DRAWDOWN_PCT = 0.05  # SAFETY FIX: 5% drawdown from starting balance kills all trading
 MODEL_PATH      = "crypto_mtf_balanced_best.zip"  # BALANCED: bear-balanced model, 63.6% WR, +0.60R expectancy
 LOG_PATH        = "crypto_live_agent.log"
@@ -588,7 +594,11 @@ def _execute_entry(symbol, ctx, state, current_price, filters, tag, memory,
     if pre_trade_balance is None or pre_trade_balance <= 0:
         log.error(f"{tag} Balance fetch returned {pre_trade_balance} — aborting entry")
         return False
-    risk_per_trade = pre_trade_balance * RISK_PER_TRADE_PCT
+    risk_pct = RISK_PER_TRADE_BY_TIER.get(tier, 0.0)
+    if risk_pct == 0.0:
+        log.warning(f"{tag} ⛔ {tier} tier — risk_pct=0, skipping entry")
+        return False
+    risk_per_trade = pre_trade_balance * risk_pct
     risk_notional  = risk_per_trade / max(sl_pct, 0.001)
     trade_notional = min(risk_notional, TRADE_NOTIONAL,
                          pre_trade_balance * LEVERAGE * 0.30)
@@ -597,24 +607,16 @@ def _execute_entry(symbol, ctx, state, current_price, filters, tag, memory,
                     f"for min_qty={min_qty} — skipping entry")
         return False
 
-    # Tier sizing
-    tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'C': 0.3, 'TRASH': 0.0}
-    tier_mult = tier_multipliers.get(tier, 0.0)
-    if tier == 'TRASH':
-        log.warning(f"{tag} ⛔ TRASH tier — skipping entry")
-        return False
-    trade_notional = trade_notional * tier_mult
     if trade_notional / max(current_price, 1) < min_qty:
-        log.warning(f"{tag} Tier-scaled notional ${trade_notional:.2f} too small "
+        log.warning(f"{tag} Tier-sized notional ${trade_notional:.2f} too small "
                     f"for min_qty={min_qty} — skipping entry")
         return False
 
-    log.info(f"{tag} 📐 Risk sizing: balance=${pre_trade_balance:,.2f} | "
-             f"1% risk=${risk_per_trade:.2f} | SL={sl_pct:.1%} | "
-             f"raw_notional=${risk_notional:,.2f} | "
+    log.info(f"{tag} 📐 Tier sizing: balance=${pre_trade_balance:,.2f} | "
+             f"Tier={tier} | risk={risk_pct:.1%} (${risk_per_trade:.2f}) | "
+             f"SL={sl_pct:.1%} | raw_notional=${risk_notional:,.2f} | "
              f"capped=${trade_notional:,.2f} | TP={tp_pct:.1%} | "
-             f"WR={memory.get_win_rate(conditions)} | "
-             f"Tier={tier} ({tier_mult:.0%})")
+             f"WR={memory.get_win_rate(conditions)}")
 
     if action == 1:  # LONG
         order, qty = open_long(exec_client, symbol, trade_notional, current_price,
