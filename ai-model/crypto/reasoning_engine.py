@@ -278,23 +278,15 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
     """
     evidence_for     = []
     evidence_against = []
-    confidence       = 0.40   # baseline — must earn above 0.45 to execute
+    confidence       = 0.30   # baseline — must earn above 0.45 to execute
 
     action_is_long  = ppo_action == 1
     action_is_short = ppo_action == 2
 
     if action_is_long or action_is_short:
 
-        # ── FIX 1: Regime direction hard-block ───────────────────────────────
-        # Based on trade memory: STRONG_BEAR conditions are 10-20% WR for LONGs.
-        # No counter-trend boosts — they were actively hurting performance.
+        # ── Regime direction hard-blocks REMOVED: any direction allowed in any regime ──
         regime = conditions.get('regime', 'LOW_QUALITY')
-        if action_is_long and regime == 'TRENDING_BEAR':
-            evidence_against.append("HARD BLOCK: TRENDING_BEAR regime — LONGs forbidden")
-            return "HARD_REJECT", 0.0, evidence_for, evidence_against
-        if action_is_short and regime == 'TRENDING_BULL':
-            evidence_against.append("HARD BLOCK: TRENDING_BULL regime — SHORTs forbidden")
-            return "HARD_REJECT", 0.0, evidence_for, evidence_against
 
         # ── FIX 2: OFF_HOURS block for new entries ───────────────────────────
         if conditions.get('session') == 'OFF_HOURS':
@@ -481,21 +473,17 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
         veto_fired, veto_wr = memory.should_veto(conditions)
         regime    = conditions.get('regime', 'LOW_QUALITY')
         atr_pct   = perception.get('atr_pct', 0.0)
-        high_vol  = (regime == 'HIGH_VOLATILITY' and atr_pct > 0.03)
 
         if veto_fired:
             verdict = "REJECT"
             evidence_against.append(f"Memory veto: WR={veto_wr:.0%} < 40% threshold")
-        elif high_vol:
-            verdict = "REJECT"
-            evidence_against.append(f"Extreme volatility block: ATR={atr_pct:.2%}")
         elif confidence >= 0.45:
             verdict = "EXECUTE"
-        elif confidence >= 0.40:
+        elif confidence >= 0.30:
             verdict = "WEAK_EXECUTE"   # only Tier B at 50% size allowed
         else:
-            verdict = "REJECT"         # below 0.40 — skip regardless
-            evidence_against.append(f"Confidence {confidence:.0%} below 0.40 minimum gate")
+            verdict = "REJECT"         # below 0.30 — skip regardless
+            evidence_against.append(f"Confidence {confidence:.0%} below 0.30 minimum gate")
     elif ppo_action == 3:
         verdict = "EXECUTE"
     else:
@@ -579,9 +567,7 @@ def classify_setup_quality(conditions, confidence, memory, perception):
     atr_pct    = perception.get('atr_pct', 0.02)
     expectancy = memory.get_expectancy(conditions)
 
-    # TRASH: block unconditionally
-    if regime == 'HIGH_VOLATILITY' and atr_pct > 0.03:
-        return 'TRASH'
+    # TRASH: block unconditionally (regime block removed — every regime tradeable)
     if expectancy is not None and expectancy < -0.3:
         return 'TRASH'
 
@@ -599,8 +585,8 @@ def classify_setup_quality(conditions, confidence, memory, perception):
     if regime_not_bad and volume_not_low and confidence >= 0.58:
         return 'A'
 
-    # B: marginal — FIX: confidence >= 0.45 required (was 0.0)
-    if confidence >= 0.45 and regime != 'HIGH_VOLATILITY':
+    # B: marginal — confidence gate only (regime restriction removed)
+    if confidence >= 0.45:
         return 'B'
 
     return 'TRASH'
