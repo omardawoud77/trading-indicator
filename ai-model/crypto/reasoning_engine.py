@@ -306,7 +306,7 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
                 confidence -= 0.10   # restored
             elif conditions['trend'] == 'STRONG_BEAR':
                 evidence_against.append("Strong downtrend — long strongly against trend")
-                confidence -= 0.22   # restored (was -0.11 in broken version)
+                confidence -= 0.15   # reduced 30% from 0.22 — was over-penalizing
 
         if action_is_short:
             if conditions['trend'] == 'STRONG_BEAR':
@@ -409,7 +409,7 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
         # ── Memory check (veto threshold raised to 40%) ───────────────────────
         veto, wr = memory.should_veto(conditions)
         if veto:
-            evidence_against.append(f"MEMORY VETO: setup has only {wr:.0%} WR historically (threshold 40%)")
+            evidence_against.append(f"MEMORY VETO: setup has only {wr:.0%} WR historically (threshold 25%)")
             confidence -= 0.30
         else:
             adj = memory.confidence_adjustment(conditions)
@@ -420,7 +420,7 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
             elif adj < -0.02:
                 wr_val = memory.get_win_rate(conditions)
                 evidence_against.append(f"Memory: similar setups won only {wr_val:.0%} historically")
-                confidence += adj
+                confidence += adj * 0.5   # penalty weight halved — was dragging confidence too low
 
         # ── Regret adjustment ─────────────────────────────────────────────────
         regret_adj = memory.get_regret_adjustment(conditions)
@@ -476,7 +476,7 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
 
         if veto_fired:
             verdict = "REJECT"
-            evidence_against.append(f"Memory veto: WR={veto_wr:.0%} < 40% threshold")
+            evidence_against.append(f"Memory veto: WR={veto_wr:.0%} < 25% threshold")
         elif confidence >= 0.45:
             verdict = "EXECUTE"
         elif confidence >= 0.30:
