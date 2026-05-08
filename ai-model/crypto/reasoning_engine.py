@@ -402,9 +402,9 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
             elif conditions['trend'] == 'MILD_BEAR':
                 evidence_against.append("Mild downtrend — long against trend")
                 confidence -= 0.10   # restored
-            elif conditions['trend'] == 'STRONG_BEAR':
+            elif conditions['trend'] == 'STRONG_BEAR' and conditions.get('regime') not in ('STRONG_BULL', 'TRENDING_BULL'):
                 evidence_against.append("Strong downtrend — long strongly against trend")
-                confidence -= 0.15   # reduced 30% from 0.22 — was over-penalizing
+                confidence -= 0.15   # skipped when composite regime overrides EMA-stack as bullish
 
         if action_is_short:
             if conditions['trend'] == 'STRONG_BEAR':
@@ -416,9 +416,9 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
             elif conditions['trend'] == 'MILD_BULL':
                 evidence_against.append("Mild uptrend — short against trend")
                 confidence -= 0.10   # restored
-            elif conditions['trend'] == 'STRONG_BULL':
+            elif conditions['trend'] == 'STRONG_BULL' and conditions.get('regime') not in ('STRONG_BEAR', 'TRENDING_BEAR'):
                 evidence_against.append("Strong uptrend — short strongly against trend")
-                confidence -= 0.22   # restored
+                confidence -= 0.22   # skipped when composite regime overrides EMA-stack as bearish
 
         # ── Momentum ──────────────────────────────────────────────────────────
         if action_is_long and conditions['momentum'] in ('STRONG_UP', 'WEAK_UP'):
