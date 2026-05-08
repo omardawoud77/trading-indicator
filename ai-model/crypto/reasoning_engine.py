@@ -98,6 +98,47 @@ def perceive(df, state):
         bullish_fvg = float(bar_3ago.get('high', bar_3ago['close'])) < bar_low
         bearish_fvg = float(bar_3ago.get('low',  bar_3ago['close'])) > bar_high
 
+    # ── Composite-regime inputs: EMAs, SMA, structure, multi-window momentum ──
+    # Use only closed bars (df[:-1]) so the live in-progress bar doesn't skew slope.
+    closes_closed = df['close'].iloc[:-1] if len(df) > 1 else df['close']
+
+    if len(closes_closed) >= 20:
+        ema20_arr = closes_closed.ewm(span=20, adjust=False).mean().values
+        ema50_arr = closes_closed.ewm(span=50, adjust=False).mean().values
+        if len(ema20_arr) >= 10:
+            e20_now, e20_then = float(ema20_arr[-1]), float(ema20_arr[-10])
+            ema20_slope = (e20_now - e20_then) / max(abs(e20_then), 1e-9)
+        else:
+            ema20_slope = 0.0
+        if len(ema50_arr) >= 10:
+            e50_now, e50_then = float(ema50_arr[-1]), float(ema50_arr[-10])
+            ema50_slope = (e50_now - e50_then) / max(abs(e50_then), 1e-9)
+        else:
+            ema50_slope = 0.0
+        sma20_val      = float(closes_closed.iloc[-20:].mean())
+        price_vs_sma20 = (close - sma20_val) / max(sma20_val, 1e-9)
+    else:
+        ema20_slope = 0.0
+        ema50_slope = 0.0
+        price_vs_sma20 = 0.0
+
+    if len(df) >= 11 and 'high' in df.columns and 'low' in df.columns:
+        highs_closed = df['high'].iloc[:-1].values
+        lows_closed  = df['low'].iloc[:-1].values
+        recent_high = float(np.max(highs_closed[-5:]))
+        prev_high   = float(np.max(highs_closed[-10:-5]))
+        recent_low  = float(np.min(lows_closed[-5:]))
+        prev_low    = float(np.min(lows_closed[-10:-5]))
+        higher_highs = recent_high > prev_high
+        higher_lows  = recent_low  > prev_low
+        lower_highs  = recent_high < prev_high
+        lower_lows   = recent_low  < prev_low
+    else:
+        higher_highs = higher_lows = lower_highs = lower_lows = False
+
+    bars_back_10 = df.iloc[-12]['close'] if len(df) >= 12 else df.iloc[0]['close']
+    bars_back_20 = df.iloc[-22]['close'] if len(df) >= 22 else df.iloc[0]['close']
+
     return {
         "price":           close,
         "price_vs_4h":     (close - h4_close) / max(h4_close, 0.01),
@@ -121,6 +162,16 @@ def perceive(df, state):
         "is_doji":         is_doji,
         "bullish_fvg":     bullish_fvg,
         "bearish_fvg":     bearish_fvg,
+        # Composite-regime inputs
+        "ema20_slope":     ema20_slope,
+        "ema50_slope":     ema50_slope,
+        "price_vs_sma20":  price_vs_sma20,
+        "higher_highs":    higher_highs,
+        "higher_lows":     higher_lows,
+        "lower_highs":     lower_highs,
+        "lower_lows":      lower_lows,
+        "return_10bars":   (close - float(bars_back_10)) / max(float(bars_back_10), 0.01),
+        "return_20bars":   (close - float(bars_back_20)) / max(float(bars_back_20), 0.01),
     }
 
 
@@ -241,31 +292,78 @@ def interpret(perception):
 # ── LAYER 2.5: REGIME CLASSIFIER ─────────────────────────────────────────────
 
 def classify_regime(conditions, perception):
-    trend      = conditions['trend']
-    momentum   = conditions['momentum']
-    volatility = conditions['volatility']
-    volume     = conditions['volume']
-    atr_pct    = perception['atr_pct']
+    """
+    Composite regime classifier.
 
-    if volatility == 'HIGH' and atr_pct > 0.025:
-        return 'HIGH_VOLATILITY'
+    Replaces the old "price-vs-EMA stack" labeller, which lagged badly on
+    real recoveries (e.g. SOL +6.5% off lows still tagged STRONG_BEAR because
+    long-period EMAs hadn't caught up).
 
-    if (trend == 'STRONG_BULL'
-            and momentum in ('STRONG_UP', 'WEAK_UP')
-            and volatility != 'HIGH'):
+    Sums four normalized signals into a [-2, +2] direction score:
+      (a) EMA slope     — avg pct change of 20/50 EMA over last 10 closed bars
+                          (saturates at ±2%)
+      (b) Structure     — higher-highs/higher-lows vs lower-highs/lower-lows
+      (c) Price vs SMA  — close vs 20-bar SMA  (±0.5)
+      (d) Multi-window momentum — avg of 3/10/20-bar pct change (saturates at ±3%)
+
+    Mapping:
+       score >=  1.5  → STRONG_BULL
+       score  >  0.5  → TRENDING_BULL
+       score  > -0.5  → RANGING
+       score >= -1.5  → TRENDING_BEAR
+       score <  -1.5  → STRONG_BEAR
+    Very low ATR (<0.3%) short-circuits to LOW_QUALITY.
+    """
+    atr_pct = float(perception.get('atr_pct', 0.0))
+
+    if atr_pct < 0.003:
+        return 'LOW_QUALITY'
+
+    score = 0.0
+
+    # (a) EMA slope
+    ema20_slope = float(perception.get('ema20_slope', 0.0))
+    ema50_slope = float(perception.get('ema50_slope', 0.0))
+    avg_slope   = (ema20_slope + ema50_slope) / 2.0
+    score += max(-1.0, min(1.0, avg_slope / 0.02))
+
+    # (b) Recent structure
+    hh = bool(perception.get('higher_highs', False))
+    hl = bool(perception.get('higher_lows',  False))
+    lh = bool(perception.get('lower_highs',  False))
+    ll = bool(perception.get('lower_lows',   False))
+    if hh and hl:
+        score += 1.0
+    elif lh and ll:
+        score -= 1.0
+    elif hh or hl:
+        score += 0.5
+    elif lh or ll:
+        score -= 0.5
+
+    # (c) Price vs 20-bar SMA
+    price_vs_sma20 = float(perception.get('price_vs_sma20', 0.0))
+    if price_vs_sma20 > 0:
+        score += 0.5
+    elif price_vs_sma20 < 0:
+        score -= 0.5
+
+    # (d) Multi-window momentum
+    r3  = float(perception.get('return_3bars',  0.0))
+    r10 = float(perception.get('return_10bars', 0.0))
+    r20 = float(perception.get('return_20bars', 0.0))
+    avg_mom = (r3 + r10 + r20) / 3.0
+    score += max(-1.0, min(1.0, avg_mom / 0.03))
+
+    if score >= 1.5:
+        return 'STRONG_BULL'
+    if score > 0.5:
         return 'TRENDING_BULL'
-
-    if (trend == 'STRONG_BEAR'
-            and momentum in ('STRONG_DOWN', 'WEAK_DOWN')
-            and volatility != 'HIGH'):
-        return 'TRENDING_BEAR'
-
-    if (trend in ('MILD_BULL', 'MILD_BEAR')
-            and momentum in ('WEAK_UP', 'WEAK_DOWN')
-            and volume in ('LOW', 'NORMAL')):
+    if score > -0.5:
         return 'RANGING'
-
-    return 'LOW_QUALITY'
+    if score >= -1.5:
+        return 'TRENDING_BEAR'
+    return 'STRONG_BEAR'
 
 
 # ── LAYER 3: REASONING ENGINE (FIXED) ────────────────────────────────────────
@@ -572,7 +670,8 @@ def classify_setup_quality(conditions, confidence, memory, perception):
         return 'TRASH'
 
     # A+: best setups
-    regime_ok     = regime in ('RANGING', 'TRENDING_BULL', 'TRENDING_BEAR')
+    regime_ok     = regime in ('RANGING', 'TRENDING_BULL', 'TRENDING_BEAR',
+                               'STRONG_BULL', 'STRONG_BEAR')
     volume_ok     = volume in ('HIGH', 'VERY_HIGH')
     momentum_ok   = momentum in ('STRONG_UP', 'STRONG_DOWN', 'WEAK_UP', 'WEAK_DOWN')
     expectancy_ok = expectancy is None or expectancy >= 0.2
