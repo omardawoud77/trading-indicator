@@ -598,7 +598,7 @@ def _execute_entry(symbol, ctx, state, current_price, filters, tag, memory,
         return False
 
     # Tier sizing
-    tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'TRASH': 0.0}
+    tier_multipliers = {'A_PLUS': 1.0, 'A': 0.8, 'B': 0.5, 'C': 0.3, 'TRASH': 0.0}
     tier_mult = tier_multipliers.get(tier, 0.0)
     if tier == 'TRASH':
         log.warning(f"{tag} ⛔ TRASH tier — skipping entry")

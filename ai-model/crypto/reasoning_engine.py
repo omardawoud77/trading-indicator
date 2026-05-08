@@ -688,6 +688,10 @@ def classify_setup_quality(conditions, confidence, memory, perception):
     if confidence >= 0.45:
         return 'B'
 
+    # C: marginal but executable — WEAK_EXECUTE range (0.30-0.45)
+    if confidence >= 0.30:
+        return 'C'
+
     return 'TRASH'
 
 
