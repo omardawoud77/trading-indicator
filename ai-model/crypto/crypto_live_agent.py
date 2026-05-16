@@ -45,7 +45,7 @@ RISK_PER_TRADE_BY_TIER = {
     'A_PLUS': 0.020,  # 2.0% — high conviction → ~$100 risk on $5000
     'A':      0.020,  # 2.0% — high conviction → ~$100 risk on $5000
     'B':      0.010,  # 1.0% — medium conviction → ~$50 risk
-    'C':      0.005,  # 0.5% — marginal/WEAK_EXECUTE → ~$25 risk
+    'C':      0.000,    # DISABLED: live data shows -$130 on 7 WEAK_EXECUTE trades vs +$177 on 4 EXECUTE trades
     'TRASH':  0.000,  # don't trade
 }
 KILL_SWITCH_DRAWDOWN_PCT = 0.05  # SAFETY FIX: 5% drawdown from starting balance kills all trading
