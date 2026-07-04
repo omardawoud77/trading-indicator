@@ -217,6 +217,57 @@ def fetch_live_balance(client):
         return None  # SAFETY FIX: callers must handle None explicitly
 
 
+# ── RATE_LIMIT: global Binance IP-ban guard ───────────────────────────────────
+# Binance -1003 bans are per-IP and EXTEND on every request made while banned.
+# When we see one, parse the 'banned until <ms>' timestamp and go fully silent
+# on the data API until it passes (+buffer). Retrying during a ban makes the
+# ban longer — the only correct response is zero requests.
+
+_BAN_UNTIL_TS = 0.0        # epoch seconds
+_BAN_LAST_LOG = 0.0        # throttle ban log spam
+
+
+def note_binance_ban(err):
+    """Record an IP ban from a -1003 error. Extends the global cooldown."""
+    global _BAN_UNTIL_TS
+    import re as _re
+    m = _re.search(r'banned until (\d+)', str(err))
+    if m:
+        until = int(m.group(1)) / 1000.0 + 60.0   # +60s safety buffer
+    else:
+        until = time.time() + 600.0                # unknown window: 10 min
+    if until > _BAN_UNTIL_TS:
+        _BAN_UNTIL_TS = until
+        remaining = max(0.0, until - time.time())
+        log.error(f"🚫 BINANCE IP BAN detected — going silent for "
+                  f"{remaining/3600:.1f}h (until "
+                  f"{datetime.fromtimestamp(until, tz=timezone.utc).isoformat()})")
+
+
+def binance_banned_now():
+    return time.time() < _BAN_UNTIL_TS
+
+
+def ban_remaining_secs():
+    return max(0.0, _BAN_UNTIL_TS - time.time())
+
+
+def log_ban_throttled():
+    """Log ban status at most once per 10 minutes."""
+    global _BAN_LAST_LOG
+    if time.time() - _BAN_LAST_LOG > 600:
+        _BAN_LAST_LOG = time.time()
+        log.warning(f"🚫 IP banned by Binance — sleeping, "
+                    f"{ban_remaining_secs()/3600:.1f}h remaining")
+
+
+def is_rate_limit_error(e):
+    try:
+        return isinstance(e, BinanceAPIException) and int(getattr(e, 'code', 0)) == -1003
+    except Exception:
+        return False
+
+
 # ── Disabled symbols persistence ─────────────────────────────────────────────
 # SAFETY FIX: disabled symbols survive restarts — cannot re-enable by restarting
 
@@ -891,25 +942,60 @@ def process_symbol(symbol, ctx):
     tag = f"[{symbol[:3]}]"   # short tag for log readability
 
     try:
-        df = fetch_mtf(data_client, symbol, bars=200)
-        if len(df) < MIN_BARS:
-            log.warning(f"{tag} Not enough bars ({len(df)} < {MIN_BARS})")
+        # ── RATE_LIMIT: full silence while IP-banned ──────────────────────────
+        if binance_banned_now():
             return
 
-        latest_bar_time = df['Datetime'].iloc[-2]
-        new_bar = latest_bar_time != ctx['last_bar_times'][symbol]
+        # ── RATE_LIMIT: clock-gated kline fetching ────────────────────────────
+        # Old behavior: fetch 4 timeframes × klines EVERY 60s cycle for every
+        # symbol (~15 req/min continuously) even with nothing to do. New:
+        # klines are only fetched when a new closed 1H bar can exist that we
+        # haven't processed. Idle cycles (flat, no pending signal) make ZERO
+        # API calls; holding/pending cycles fetch only the mark price.
+        now_utc    = datetime.now(timezone.utc)
+        hour_floor = now_utc.replace(minute=0, second=0, microsecond=0)
+        # last closed 1H bar's OPEN time (bar opening at 14:00 closes at 15:00)
+        expected_closed = hour_floor - timedelta(hours=1)
+        grace_ok   = (now_utc - hour_floor).total_seconds() >= 20  # let bar data settle
+        last_seen  = ctx['last_bar_times'][symbol]
+        may_have_new_bar = grace_ok and (
+            last_seen is None or pd.Timestamp(last_seen) != pd.Timestamp(expected_closed))
 
-        # SL_SOFTWARE: fetch live mark price every cycle so SL/TP/protection
-        # checks react to real-time moves, not just 1H bar closes.
+        has_position = state.get('position', 0) != 0
+        has_pending  = bool(state.get('pending_signal'))
+
+        if not may_have_new_bar and not has_position and not has_pending:
+            return  # RATE_LIMIT: truly idle — zero API calls this cycle
+
+        df = None
+        new_bar = False
+        latest_bar_time = last_seen
+        if may_have_new_bar:
+            df = fetch_mtf(data_client, symbol, bars=200)
+            if len(df) < MIN_BARS:
+                log.warning(f"{tag} Not enough bars ({len(df)} < {MIN_BARS})")
+                return
+            latest_bar_time = df['Datetime'].iloc[-2]
+            new_bar = latest_bar_time != ctx['last_bar_times'][symbol]
+
+        # SL_SOFTWARE: fetch live mark price so SL/TP/protection checks react
+        # to real-time moves. RATE_LIMIT: this is now the ONLY per-minute call.
         try:
             mark_price = float(data_client.futures_mark_price(symbol=symbol)['markPrice'])
         except Exception as _mpe:
-            mark_price = float(df['close'].iloc[-2])
-            log.warning(f"{tag} mark_price fetch failed ({_mpe}) — falling back to bar close ${mark_price:,.2f}")
+            if is_rate_limit_error(_mpe):
+                note_binance_ban(_mpe)
+                return
+            if df is not None:
+                mark_price = float(df['close'].iloc[-2])
+                log.warning(f"{tag} mark_price fetch failed ({_mpe}) — falling back to bar close ${mark_price:,.2f}")
+            else:
+                log.warning(f"{tag} mark_price fetch failed ({_mpe}) and no klines this cycle — skipping")
+                return
         current_price = mark_price  # used for SL/TP/protection + entry sizing
 
         # Nothing to manage when no new bar AND no open position
-        if not new_bar and state.get('position', 0) == 0:
+        if not new_bar and state.get('position', 0) == 0 and not has_pending:
             return
 
         if new_bar:
@@ -1531,7 +1617,10 @@ def process_symbol(symbol, ctx):
                 log.info(f"{tag} 📋 Trades: {state['trade_count']} | WR: {wr:.1%} | PnL: ${state['total_pnl_usdt']:+.2f}")
 
     except Exception as e:
-        log.error(f"{tag} ❌ Cycle error: {e}", exc_info=True)
+        if is_rate_limit_error(e):
+            note_binance_ban(e)   # RATE_LIMIT: record ban, main loop goes silent
+        else:
+            log.error(f"{tag} ❌ Cycle error: {e}", exc_info=True)
 
 
 # ── Agent initialization ──────────────────────────────────────────────────────
@@ -1662,6 +1751,13 @@ def main():
 
     while True:
         try:
+            # ── RATE_LIMIT: during an IP ban, make ZERO data-API requests. ──
+            # Every request made while banned EXTENDS the ban. Sleep it out.
+            if binance_banned_now():
+                log_ban_throttled()
+                time.sleep(min(300, max(30, ban_remaining_secs())))
+                continue
+
             # SAFETY FIX: exchange-based kill switch — fresh balance every cycle
             current_balance = fetch_live_balance(exec_client)
             if current_balance is None:
