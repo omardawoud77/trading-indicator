@@ -18,6 +18,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import time
+import shutil
 import tempfile
 import logging
 import json
@@ -60,24 +61,42 @@ MIN_BARS        = 50
 FUTURES_TESTNET_URL = "https://testnet.binancefuture.com/fapi"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DISABLED_SYMBOLS_PATH = os.path.join(HERE, "disabled_symbols.json")  # SAFETY FIX: persist across restarts
+
+# Persistent dir (Railway volume via PERSIST_DATA_DIR) for everything the bot
+# must remember across redeploys: position state, trade memory, logs, disabled
+# symbols. Falls back to HERE when the env var is unset (local runs).
+PERSIST_DIR = os.environ.get("PERSIST_DATA_DIR", HERE)
+
+def _persist_path(filename):
+    """Path on the persistent volume; seeded once from the repo copy if the
+    volume doesn't have the file yet (e.g. calibrated trade_memory json)."""
+    if PERSIST_DIR == HERE:
+        return os.path.join(HERE, filename)
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+    dst = os.path.join(PERSIST_DIR, filename)
+    src = os.path.join(HERE, filename)
+    if not os.path.exists(dst) and os.path.exists(src):
+        shutil.copy2(src, dst)
+    return dst
+
+DISABLED_SYMBOLS_PATH = _persist_path("disabled_symbols.json")  # SAFETY FIX: persist across restarts
 
 def state_path_for(symbol):
-    return os.path.join(HERE, f"state_{symbol.lower()}.json")
+    return _persist_path(f"state_{symbol.lower()}.json")
 
 def memory_path_for(symbol):
     """BTC keeps the legacy filename for backward compat with the calibrated regret memory."""
     if symbol == "BTCUSDT":
-        return os.path.join(HERE, "trade_memory.json")
-    return os.path.join(HERE, f"trade_memory_{symbol.lower()}.json")
+        return _persist_path("trade_memory.json")
+    return _persist_path(f"trade_memory_{symbol.lower()}.json")
 
 def trade_log_path_for(symbol):
     if symbol == "BTCUSDT":
-        return os.path.join(HERE, "trade_log.csv")
-    return os.path.join(HERE, f"trade_log_{symbol.lower()}.csv")
+        return _persist_path("trade_log.csv")
+    return _persist_path(f"trade_log_{symbol.lower()}.csv")
 
 def trade_events_path_for(symbol):
-    return os.path.join(HERE, f"trade_events_{symbol.lower()}.jsonl")
+    return _persist_path(f"trade_events_{symbol.lower()}.jsonl")
 
 def log_trade_event(symbol, event_type, action, qty, price, trade_id="",
                     sl_price=0.0, tp_pct=0.0, pnl_usdt=0.0, pnl_pct=0.0,
