@@ -368,10 +368,17 @@ def classify_regime(conditions, perception):
 
 # ── LAYER 3: REASONING ENGINE (FIXED) ────────────────────────────────────────
 
-def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
+def reason(ppo_action, conditions, perception, memory, sentiment_signal=None,
+           model_probs=None):
     """
     sentiment_signal: dict from SentimentAgent, e.g.:
         {'direction': 'BEARISH', 'strength': 0.7, 'sources': [...]}
+    model_probs: optional np.array of PPO policy action probabilities
+        [P(HOLD), P(LONG), P(SHORT), P(CLOSE)]. When provided, the model's
+        own conviction becomes the PRIMARY confidence signal and the
+        rule checklist below is demoted to a secondary modifier + hard vetoes.
+        (PROB_GATE fix: the old rule-only confidence was historically
+        inverted — rejected trades won 51% vs 32% for executed ones.)
     Returns (verdict, confidence, evidence_for, evidence_against)
     """
     evidence_for     = []
@@ -418,7 +425,7 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
                 confidence -= 0.10   # restored
             elif conditions['trend'] == 'STRONG_BULL' and conditions.get('regime') not in ('STRONG_BEAR', 'TRENDING_BEAR'):
                 evidence_against.append("Strong uptrend — short strongly against trend")
-                confidence -= 0.22   # skipped when composite regime overrides EMA-stack as bearish
+                confidence -= 0.15   # PROB_GATE: symmetric with long penalty (was -0.22, suppressed all shorts)
 
         # ── Momentum ──────────────────────────────────────────────────────────
         if action_is_long and conditions['momentum'] in ('STRONG_UP', 'WEAK_UP'):
@@ -565,8 +572,20 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
             confidence += 0.05
 
     confidence = max(0.05, min(0.95, confidence))
+    rule_conf  = confidence   # PROB_GATE: keep checklist score separate
 
-    # ── FIX 3: Restored real confidence gate — 0.45 minimum ─────────────────
+    # ── PROB_GATE: model conviction as primary signal ────────────────────────
+    model_conf = None
+    if model_probs is not None and ppo_action in (1, 2):
+        try:
+            model_conf = float(model_probs[int(ppo_action)])
+            evidence_for.append(f"Model conviction P({'LONG' if ppo_action == 1 else 'SHORT'})={model_conf:.0%}")
+            # Blend: model is primary, checklist is secondary
+            confidence = max(0.05, min(0.95, 0.60 * model_conf + 0.40 * rule_conf))
+        except Exception:
+            model_conf = None
+
+    # ── Confidence gate ──────────────────────────────────────────────────────
     if ppo_action in (1, 2):
         veto_fired, veto_wr = memory.should_veto(conditions)
         regime    = conditions.get('regime', 'LOW_QUALITY')
@@ -575,8 +594,24 @@ def reason(ppo_action, conditions, perception, memory, sentiment_signal=None):
         if veto_fired:
             verdict = "REJECT"
             evidence_against.append(f"Memory veto: WR={veto_wr:.0%} < 25% threshold")
+        elif model_conf is not None:
+            # PROB_GATE: gate on the model's own probability first; the
+            # checklist can only veto (rule_conf < 0.30 = actively hostile
+            # conditions like OFF_HOURS proximity, stacked counter-evidence).
+            if model_conf >= 0.55 and rule_conf >= 0.30:
+                verdict = "EXECUTE"
+            elif model_conf >= 0.45 and rule_conf >= 0.30:
+                verdict = "WEAK_EXECUTE"
+            else:
+                verdict = "REJECT"
+                if model_conf < 0.45:
+                    evidence_against.append(
+                        f"Model conviction {model_conf:.0%} below 0.45 minimum gate")
+                else:
+                    evidence_against.append(
+                        f"Checklist veto: rule confidence {rule_conf:.0%} < 0.30")
         elif confidence >= 0.45:
-            verdict = "EXECUTE"
+            verdict = "EXECUTE"        # legacy path (no probs available)
         elif confidence >= 0.30:
             verdict = "WEAK_EXECUTE"   # only Tier B at 50% size allowed
         else:
@@ -697,15 +732,18 @@ def classify_setup_quality(conditions, confidence, memory, perception):
 
 # ── LAYER 4: DECISION + EXPLANATION ──────────────────────────────────────────
 
-def decide(ppo_action, conditions, perception, memory, narrative, sentiment_signal=None):
+def decide(ppo_action, conditions, perception, memory, narrative, sentiment_signal=None,
+           model_probs=None):
     """
     sentiment_signal: optional dict from SentimentAgent
+    model_probs: optional PPO policy action probabilities (see reason())
     Returns (verdict, confidence, reasoning_text, tier)
     """
     action_names = {0: "HOLD", 1: "BUY", 2: "SELL", 3: "CLOSE"}
 
     verdict, confidence, evidence_for, evidence_against = reason(
-        ppo_action, conditions, perception, memory, sentiment_signal
+        ppo_action, conditions, perception, memory, sentiment_signal,
+        model_probs=model_probs
     )
 
     lines = []
@@ -736,6 +774,12 @@ def decide(ppo_action, conditions, perception, memory, narrative, sentiment_sign
     expectancy = memory.get_expectancy(conditions)
     if expectancy is not None:
         lines.append(f"Expectancy: {expectancy:+.2f}R per trade")
+    if model_probs is not None:
+        try:
+            lines.append("Model P(H/L/S/C): " +
+                         "/".join(f"{float(p):.0%}" for p in model_probs))
+        except Exception:
+            pass
     lines.append(f"Confidence: {confidence:.0%}")
     lines.append(f"Quality: {tier}")
     lines.append(f"Verdict: {verdict}")

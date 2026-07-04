@@ -49,6 +49,9 @@ RISK_PER_TRADE_BY_TIER = {
     'TRASH':  0.000,  # don't trade
 }
 KILL_SWITCH_DRAWDOWN_PCT = 0.05  # SAFETY FIX: 5% drawdown from starting balance kills all trading
+MAX_HOLD_HOURS  = 48             # HORIZON_FIX: match training max_hold_bars=48 (1H bars).
+                                 # Was 8h — the model learned exits on a 48h horizon,
+                                 # force-closing at 8h invalidated its learned policy.
 MODEL_PATH      = "crypto_mtf_balanced_best.zip"  # BALANCED: bear-balanced model, 63.6% WR, +0.60R expectancy
 LOG_PATH        = "crypto_live_agent.log"
 LEGACY_BTC_STATE = "crypto_live_state.json"  # pre-multisymbol path, migrated on first load
@@ -471,14 +474,72 @@ def get_sl_fill_price(client, symbol, tag=""):
     return None
 
 
+# ── PROB_GATE: extract policy action probabilities ───────────────────────────
+
+def get_action_probs(model, obs):
+    """Return PPO policy action probabilities [P(HOLD),P(LONG),P(SHORT),P(CLOSE)]
+    for a single observation, or None on failure. This is the model's real
+    conviction — deterministic argmax alone discards it."""
+    try:
+        import torch
+        with torch.no_grad():
+            t, _ = model.policy.obs_to_tensor(obs)
+            dist = model.policy.get_distribution(t)
+            return dist.distribution.probs.cpu().numpy().flatten()
+    except Exception as e:
+        log.warning(f"get_action_probs failed: {e}")
+        return None
+
+
+# ── SHADOW_LOG: record EVERY model signal regardless of gate outcome ─────────
+# Purpose: build a real dataset to tune the gate on data instead of
+# hand-tuned constants. One row per new-bar decision per symbol.
+
+def shadow_log_path_for(symbol):
+    return os.path.join(HERE, f"shadow_log_{symbol.lower()}.csv")
+
+
+def log_shadow_signal(symbol, bar_ts, action, model_probs, verdict, confidence,
+                      rule_conf, tier, conditions, price):
+    try:
+        import csv
+        path = shadow_log_path_for(symbol)
+        new_file = not os.path.exists(path)
+        probs = list(model_probs) if model_probs is not None else [None] * 4
+        cond = conditions or {}
+        with open(path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts_utc", "bar_ts", "action",
+                            "p_hold", "p_long", "p_short", "p_close",
+                            "verdict", "confidence", "rule_conf", "tier",
+                            "regime", "trend", "momentum", "volume", "session",
+                            "price"])
+            w.writerow([
+                datetime.now(timezone.utc).isoformat(), bar_ts, int(action),
+                *[f"{float(p):.4f}" if p is not None else "" for p in probs],
+                verdict or "", f"{float(confidence):.4f}",
+                f"{float(rule_conf):.4f}" if rule_conf is not None else "",
+                tier or "",
+                cond.get('regime', ''), cond.get('trend', ''),
+                cond.get('momentum', ''), cond.get('volume', ''),
+                cond.get('session', ''),
+                f"{float(price):.4f}" if price else "",
+            ])
+    except Exception as e:
+        log.warning(f"[{symbol[:3]}] shadow log write failed: {e}")
+
+
 # ── Multi-agent orchestrator helpers ──────────────────────────────────────────
 
 def orchestrator_gate(symbol, action, conditions, perception, memory,
-                      state, narrative, ctx, log, tag):
+                      state, narrative, ctx, log, tag, model_probs=None,
+                      bar_ts=None):
     """
     Multi-agent orchestrated gate. Replaces the old single reasoning gate.
     Returns (verdict, confidence, reasoning_text, tier, sentiment_signal, audit)
     or None if we should skip this cycle.
+    model_probs: PPO policy action probabilities — primary confidence signal.
     """
     sentiment_agent  = ctx.get('sentiment_agent')
     position_auditor = ctx.get('position_auditor')
@@ -494,10 +555,17 @@ def orchestrator_gate(symbol, action, conditions, perception, memory,
     # ── Agent 2: Reasoning Engine (fixed) ────────────────────────────
     verdict, confidence, reasoning_text, tier = decide(
         action, conditions, perception, memory, narrative,
-        sentiment_signal=sentiment_signal
+        sentiment_signal=sentiment_signal, model_probs=model_probs
     )
 
     log.info(f"\n{'='*55}\n{tag} {reasoning_text}\n{'='*55}")
+
+    # ── SHADOW_LOG: record every decision, executed or not ────────────
+    log_shadow_signal(
+        symbol, bar_ts, action, model_probs, verdict, confidence,
+        rule_conf=None, tier=tier, conditions=conditions,
+        price=perception.get('price', 0.0) if perception else 0.0,
+    )
 
     # ── Agent 3: Position Auditor (only when in trade) ────────────────
     if state.get('position', 0) != 0 and position_auditor:
@@ -727,38 +795,70 @@ def fetch_15m_df(client, symbol, limit=20):
     return df
 
 
-def check_15m_confirmation(df_15m, action):
+def check_15m_confirmation(df_15m, action, tier=None):
     """
-    Validate a 1H-approved signal against the 15m timeframe.
+    PULLBACK_FIX: Validate a 1H-approved signal against the 15m timeframe.
     Returns (ok: bool, reason: str).
-      a) 15m trend aligns with signal direction (last 3 closed bars in direction)
-      b) 15m momentum not exhausted (live bar move from open <= 1%)
-      c) caller is responsible for the 'no open position' check
+
+    The old filter required 3 consecutive 15m closes IN the signal direction —
+    i.e. it forced every entry into a momentum-chase profile. Seed data showed
+    the model's BEST setups were dip entries (STRONG_DOWN buckets: 72-76% WR)
+    and its WORST were chase entries (WEAK_UP buckets). The old filter selected
+    for exactly the losing profile and structurally blocked shorts too.
+
+    New logic:
+      a) A+/A tiers: confirmation waived entirely (high conviction — enter now)
+      b) B/C tiers: PULLBACK entry — for LONG, price must have pulled back
+         0.2%-2.0% from the recent 15m high (buying the dip, not the breakout).
+         For SHORT, mirrored against the recent 15m low.
+      c) Momentum-exhaustion guard kept: live 15m bar move from open <= 1%
+      d) caller is responsible for the 'no open position' check
     """
-    if len(df_15m) < 4:
+    # (a) High-conviction tiers skip 15m confirmation
+    if tier in ('A_PLUS', 'A'):
+        return True, f"tier {tier} — 15m confirmation waived (high conviction)"
+
+    if len(df_15m) < 10:
         return False, f"not enough 15m bars ({len(df_15m)})"
 
-    closes = df_15m['close'].values
-    # last 3 closed bars (index -4..-2 are closed, -1 is the live in-progress bar)
-    c3, c2, c1 = float(closes[-4]), float(closes[-3]), float(closes[-2])
-
-    if action == 1:  # LONG
-        if not (c3 < c2 < c1):
-            return False, f"15m closes not ascending: {c3:.2f} → {c2:.2f} → {c1:.2f}"
-    elif action == 2:  # SHORT
-        if not (c3 > c2 > c1):
-            return False, f"15m closes not descending: {c3:.2f} → {c2:.2f} → {c1:.2f}"
-    else:
-        return False, f"unsupported action {action}"
-
-    # Momentum-exhaustion guard on the live (in-progress) 15m bar
-    live_open = float(df_15m['open'].iloc[-1])
+    live_open  = float(df_15m['open'].iloc[-1])
     live_close = float(df_15m['close'].iloc[-1])
+    price      = live_close
+
+    # (c) Momentum-exhaustion guard on the live (in-progress) 15m bar
     move_pct = abs(live_close - live_open) / max(live_open, 1e-9)
     if move_pct > 0.01:
         return False, f"15m momentum exhausted: {move_pct:.2%} from open"
 
-    return True, f"trend aligned + momentum healthy ({move_pct:.2%} from 15m open)"
+    # (b) Pullback logic over the last 8 CLOSED 15m bars (exclude live bar)
+    window = df_15m.iloc[-9:-1]
+    recent_high = float(window['high'].max())
+    recent_low  = float(window['low'].min())
+
+    PULLBACK_MIN = 0.002   # 0.2% — enough of a dip to not be a breakout chase
+    PULLBACK_MAX = 0.020   # 2.0% — beyond this the 1H thesis may be breaking
+
+    if action == 1:  # LONG — want price pulled back from recent high
+        pullback = (recent_high - price) / max(recent_high, 1e-9)
+        if pullback < PULLBACK_MIN:
+            return False, (f"no pullback yet: {pullback:.2%} below 15m high "
+                           f"${recent_high:,.2f} — avoiding breakout chase")
+        if pullback > PULLBACK_MAX:
+            return False, (f"pullback too deep: {pullback:.2%} below 15m high — "
+                           f"possible thesis break")
+        return True, f"dip entry OK: {pullback:.2%} below recent 15m high"
+
+    elif action == 2:  # SHORT — want price bounced up from recent low
+        bounce = (price - recent_low) / max(recent_low, 1e-9)
+        if bounce < PULLBACK_MIN:
+            return False, (f"no bounce yet: {bounce:.2%} above 15m low "
+                           f"${recent_low:,.2f} — avoiding breakdown chase")
+        if bounce > PULLBACK_MAX:
+            return False, (f"bounce too high: {bounce:.2%} above 15m low — "
+                           f"possible thesis break")
+        return True, f"bounce entry OK: {bounce:.2%} above recent 15m low"
+
+    return False, f"unsupported action {action}"
 
 
 # ── Per-symbol cycle logic ────────────────────────────────────────────────────
@@ -1039,16 +1139,26 @@ def process_symbol(symbol, ctx):
             # ── Model decision ───────────────────────────────────────────────
             action, _ = model.predict(obs, deterministic=True)
             action = int(action)
+            model_probs = get_action_probs(model, obs)  # PROB_GATE
             action_names = {0: "HOLD", 1: "BUY (long)", 2: "SELL (short)", 3: "CLOSE"}
-            log.info(f"{tag} 🤖 Decision: {action_names[action]} | Position: {state['position']}")
+            if model_probs is not None:
+                log.info(f"{tag} 🤖 Decision: {action_names[action]} | "
+                         f"P(H/L/S/C)={'/'.join(f'{p:.0%}' for p in model_probs)} | "
+                         f"Position: {state['position']}")
+            else:
+                log.info(f"{tag} 🤖 Decision: {action_names[action]} | Position: {state['position']}")
 
             # ── Reasoning gate ───────────────────────────────────────────────
             perception = perceive(df, state)
             conditions, narrative = interpret(perception)
 
+            bar_ts_for_log = (latest_bar_time.isoformat()
+                              if hasattr(latest_bar_time, 'isoformat')
+                              else str(latest_bar_time))
             result = orchestrator_gate(
                 symbol, action, conditions, perception, memory,
-                state, narrative, ctx, log, tag
+                state, narrative, ctx, log, tag,
+                model_probs=model_probs, bar_ts=bar_ts_for_log
             )
             if result is None:
                 if state.get('last_rejected_action') is not None:
@@ -1131,7 +1241,8 @@ def process_symbol(symbol, ctx):
                     save_state(state, state_path)
                     try:
                         df_15m = fetch_15m_df(data_client, symbol, limit=20)
-                        ok, why = check_15m_confirmation(df_15m, int(pending['action']))
+                        ok, why = check_15m_confirmation(df_15m, int(pending['action']),
+                                                         tier=pending.get('tier'))
                         if ok:
                             log.info(f"{tag} ✅ 15m confirmation OK: {why}")
                             placed = _execute_entry(
@@ -1167,16 +1278,16 @@ def process_symbol(symbol, ctx):
                 state.pop('_auditor_exit', None)
                 state.pop('_auditor_reason', None)
 
-            # 8-hour intraday time limit — force close any position held > 8h
+            # HORIZON_FIX: time limit now matches the training horizon (48 bars)
             if not force_close and state.get('entry_time'):
                 try:
                     entry_dt = datetime.fromisoformat(state['entry_time'])
                     held_seconds = (datetime.now(timezone.utc) - entry_dt).total_seconds()
-                    if held_seconds > 8 * 3600:
+                    if held_seconds > MAX_HOLD_HOURS * 3600:
                         force_close = True
-                        close_reason = "TIME_LIMIT: 8h intraday limit"
+                        close_reason = f"TIME_LIMIT: {MAX_HOLD_HOURS}h limit"
                         log.warning(f"{tag} ⏰ TIME LIMIT: position held "
-                                    f"{held_seconds/3600:.1f}h > 8h — force closing")
+                                    f"{held_seconds/3600:.1f}h > {MAX_HOLD_HOURS}h — force closing")
                 except Exception as _te:
                     log.warning(f"{tag} Could not check entry time for 8h limit: {_te}")
 
