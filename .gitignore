@@ -1,0 +1,24 @@
+# OS / editor junk
+.DS_Store
+__pycache__/
+
+# Logs
+*.log
+ai-model/crypto/logs_tech/
+
+# Model artifacts & data dumps (not source — reproducible or bulky)
+*.zip
+ai-model/nq_*.pkl
+ai-model/booster.json
+ai-model/backtest_results.json
+ai-model/backtest_v2_results.json
+ai-model/trades_export*.csv
+ai-model/real_trades*.csv
+*.backup
+*_backup.py
+
+# Phase 2 offline scaffolding lives in the inner ifvg-ai-bot repo, not here
+ai-model/phase2/
+
+# Local runtime state (lives on the Railway volume in production)
+ai-model/crypto/crypto_live_state.json
