@@ -22,3 +22,25 @@ ai-model/phase2/
 
 # Local runtime state (lives on the Railway volume in production)
 ai-model/crypto/crypto_live_state.json
+
+# Tracked by the inner ifvg-ai-bot repo (ai-model/.git), not deployed from here
+ai-model/.gitignore
+ai-model/Procfile
+ai-model/runtime.txt
+ai-model/backtest*.py
+ai-model/convert_real_trades.py
+ai-model/enrich_trades.py
+ai-model/human_knowledge.json
+ai-model/lessons.json
+ai-model/live_app.py
+ai-model/live_trades.json
+ai-model/requirements_rl.txt
+ai-model/rl_*.py
+ai-model/train_real.py
+ai-model/update_dataset.py
+ai-model/crypto/.gitignore
+ai-model/crypto/crypto_env.py
+ai-model/crypto/crypto_train*.py
+ai-model/crypto/regret_trainer.py
+ai-model/crypto/requirements.txt
+ai-model/crypto/rl_train*.py
