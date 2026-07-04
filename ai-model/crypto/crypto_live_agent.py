@@ -546,8 +546,13 @@ def get_action_probs(model, obs):
 # Purpose: build a real dataset to tune the gate on data instead of
 # hand-tuned constants. One row per new-bar decision per symbol.
 
+# Persistent dir (Railway volume) via SHADOW_DATA_DIR; falls back to HERE.
+SHADOW_DIR = os.environ.get("SHADOW_DATA_DIR", HERE)
+
+
 def shadow_log_path_for(symbol):
-    return os.path.join(HERE, f"shadow_log_{symbol.lower()}.csv")
+    os.makedirs(SHADOW_DIR, exist_ok=True)
+    return os.path.join(SHADOW_DIR, f"shadow_log_{symbol.lower()}.csv")
 
 
 def log_shadow_signal(symbol, bar_ts, action, model_probs, verdict, confidence,
