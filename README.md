@@ -23,6 +23,15 @@ This indicator provides technical analysis tools tailored for intraday and swing
 | MNQ1! | CME | Micro Nasdaq 100 Futures |
 | MES1! | CME | Micro S&P 500 Futures |
 
+## Files
+
+| File | Type | Description |
+|---|---|---|
+| `indicator.pine` | Indicator | `IFVG + AI Score v2` — visual overlay with signals, levels, and momentum analysis |
+| `strategy.pine` | Strategy | `NQ/SPX IFVG Strategy` — backtestable strategy for the TradingView Strategy Tester |
+
+Use `indicator.pine` to plot signals on a chart, or `strategy.pine` to run backtests.
+
 ## Requirements
 
 - [TradingView](https://www.tradingview.com) account (Free or Pro)
@@ -31,7 +40,7 @@ This indicator provides technical analysis tools tailored for intraday and swing
 ## Usage
 
 1. Open TradingView and navigate to the Pine Script Editor (`/` → Pine Editor).
-2. Copy the contents of the `.pine` script file.
+2. Copy the contents of `indicator.pine` (or `strategy.pine` for backtesting).
 3. Paste into the editor and click **Add to chart**.
 4. Configure the indicator settings to match your trading style and timeframe.
 
