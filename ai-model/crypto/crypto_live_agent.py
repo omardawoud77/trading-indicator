@@ -519,10 +519,23 @@ def cancel_symbol_stops(client, symbol, tag=""):
     except Exception as e:
         log.warning(f"{tag} HARD_STOP: cancel regular orders failed: {e}")
     try:
-        client._request_futures_api(
-            "delete", "algoOrders", True, data={"symbol": symbol})
+        # bulk DELETE isn't available on all deployments (-5000 on testnet):
+        # list the symbol's open algo orders and cancel each by algoId.
+        r = client._request_futures_api(
+            "get", "openAlgoOrders", True, data={"symbol": symbol})
+        orders = r if isinstance(r, list) else r.get("orders", [])
+        for o in orders:
+            if o.get("symbol") != symbol:
+                continue
+            try:
+                client._request_futures_api(
+                    "delete", "algoOrder", True, data={"algoId": o["algoId"]})
+                log.info(f"{tag} HARD_STOP: cancelled algoId={o['algoId']}")
+            except Exception as e:
+                log.warning(f"{tag} HARD_STOP: cancel algoId={o.get('algoId')} "
+                            f"failed: {e}")
     except Exception as e:
-        log.warning(f"{tag} HARD_STOP: cancel algo orders failed: {e}")
+        log.warning(f"{tag} HARD_STOP: listing algo orders failed: {e}")
 
 
 def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
