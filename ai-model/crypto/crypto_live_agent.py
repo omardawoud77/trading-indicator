@@ -511,16 +511,40 @@ def emergency_close_position(client, symbol, position, qty, tag=""):
 
 
 def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
-                          disabled_symbols, tag="", state=None):  # SL_SOFTWARE
-    """SL_SOFTWARE: testnet doesn't support STOP_MARKET, manage SL in software.
-    Stores the SL price in state for the cycle loop to check on each bar.
-    The unused exchange-related parameters are kept for call-site compatibility."""  # SL_SOFTWARE
-    if state is not None:  # SL_SOFTWARE
-        state['sl_price'] = float(sl_price)  # SL_SOFTWARE
-        log.info(f"{tag} SL stored in software @ ${sl_price} (side={sl_side})")  # SL_SOFTWARE
-    else:  # SL_SOFTWARE
-        log.warning(f"{tag} SL_SOFTWARE: state not passed — SL price NOT persisted")  # SL_SOFTWARE
-    return True  # SL_SOFTWARE
+                          disabled_symbols, tag="", state=None):
+    """HARD_STOP: two-layer stop protection.
+    Layer 1 (software): sl_price stored in state; the cycle loop checks it
+    every minute — unchanged behavior.
+    Layer 2 (exchange): a real STOP_MARKET closePosition order resting on
+    Binance's servers, so the position stays protected even if this process,
+    Railway, or the network dies mid-trade. Cancel-then-place is idempotent,
+    which also makes breakeven/trail updates a clean replace.
+    Returns True as long as the software layer is armed."""
+    if state is not None:
+        state['sl_price'] = float(sl_price)
+        log.info(f"{tag} SL armed in software @ ${sl_price} (side={sl_side})")
+    else:
+        log.warning(f"{tag} SL: state not passed — SL price NOT persisted")
+
+    try:  # HARD_STOP: clear any stale stop before placing the new one
+        client.futures_cancel_all_open_orders(symbol=symbol)
+    except Exception as e:
+        log.warning(f"{tag} HARD_STOP: pre-place cancel failed: {e}")
+    try:
+        order = client.futures_create_order(
+            symbol=symbol, side=sl_side, type="STOP_MARKET",
+            stopPrice=sl_price, closePosition="true",
+            workingType="MARK_PRICE")
+        if state is not None:
+            state['sl_order_id'] = order.get('orderId')
+        log.info(f"{tag} 🛡️ HARD_STOP resting on exchange @ ${sl_price} "
+                 f"(orderId={order.get('orderId')})")
+    except Exception as e:
+        if state is not None:
+            state['sl_order_id'] = None
+        log.critical(f"{tag} 🛡️ HARD_STOP placement FAILED — running on "
+                     f"software SL only: {e}")
+    return True
 
 
 # ── Helper: get SL fill price from recent orders ────────────────────────────
@@ -1113,6 +1137,11 @@ def process_symbol(symbol, ctx):
                     close_reason="SL_RECONCILE",
                     confidence=state.get('entry_confidence', 0.0),
                     verdict=state.get('entry_verdict', ''))
+                try:  # HARD_STOP: clear leftover orders now that we're flat
+                    exec_client.futures_cancel_all_open_orders(symbol=symbol)
+                except Exception as e:
+                    log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                state['sl_order_id'] = None
                 state['position'] = 0
                 state['entry_price'] = 0.0
                 state['entry_time'] = None
@@ -1188,6 +1217,11 @@ def process_symbol(symbol, ctx):
                     # Close the exchange position to resolve ambiguity
                     success, _, _ = emergency_close_position(
                         exec_client, symbol, exchange_side, abs(exchange_qty), tag)
+                    try:  # HARD_STOP: clear leftover orders now that we're flat
+                        exec_client.futures_cancel_all_open_orders(symbol=symbol)
+                    except Exception as e:
+                        log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                    state['sl_order_id'] = None
                     state['position'] = 0
                     state['entry_price'] = 0.0
                     state['entry_time'] = None
@@ -1436,6 +1470,18 @@ def process_symbol(symbol, ctx):
                     force_close = True
                     close_reason = "ACCOUNT_PROTECTION"
 
+            # ── HARD_STOP: ensure an exchange-side stop is resting for this
+            # position (covers restarts, deploys mid-trade, and prior failures) ──
+            if (not force_close and not state.get('sl_order_id')
+                    and state.get('sl_price', 0) > 0):
+                hs_side = "SELL" if state['position'] == 1 else "BUY"
+                log.warning(f"{tag} 🛡️ No exchange stop resting — placing one now")
+                safe_place_sl_or_exit(exec_client, symbol, hs_side,
+                                      state['sl_price'], state['position'],
+                                      state['qty'], disabled_symbols, tag,
+                                      state=state)
+                save_state(state, state_path)
+
             # ── Breakeven: move SL to entry when price reaches 50% of TP distance ──
             if not force_close and not state.get('breakeven_set', False):
                 be_triggered = False
@@ -1605,6 +1651,11 @@ def process_symbol(symbol, ctx):
                         except Exception as e:
                             log.error(f"{tag} ❌ Memory record failed: {e}")
 
+                    try:  # HARD_STOP: clear the resting stop now that we're flat
+                        exec_client.futures_cancel_all_open_orders(symbol=symbol)
+                    except Exception as e:
+                        log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                    state['sl_order_id'] = None
                     state['position'] = 0
                     state['entry_price'] = 0.0
                     state['entry_time'] = None
