@@ -510,15 +510,32 @@ def emergency_close_position(client, symbol, position, qty, tag=""):
     return False, 0.0, 0.0
 
 
+def cancel_symbol_stops(client, symbol, tag=""):
+    """HARD_STOP: cancel BOTH regular open orders and conditional (algo)
+    orders for a symbol. Binance migrated STOP_MARKET etc. to the Algo
+    Order API (2025-12-09), so each family needs its own cancel call."""
+    try:
+        client.futures_cancel_all_open_orders(symbol=symbol)
+    except Exception as e:
+        log.warning(f"{tag} HARD_STOP: cancel regular orders failed: {e}")
+    try:
+        client._request_futures_api(
+            "delete", "algoOrders", True, data={"symbol": symbol})
+    except Exception as e:
+        log.warning(f"{tag} HARD_STOP: cancel algo orders failed: {e}")
+
+
 def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
                           disabled_symbols, tag="", state=None):
     """HARD_STOP: two-layer stop protection.
     Layer 1 (software): sl_price stored in state; the cycle loop checks it
     every minute — unchanged behavior.
-    Layer 2 (exchange): a real STOP_MARKET closePosition order resting on
-    Binance's servers, so the position stays protected even if this process,
-    Railway, or the network dies mid-trade. Cancel-then-place is idempotent,
-    which also makes breakeven/trail updates a clean replace.
+    Layer 2 (exchange): a conditional STOP_MARKET closePosition order resting
+    on Binance's servers (POST /fapi/v1/algoOrder — the old order endpoint
+    rejects conditional types with -4120 since the Algo API migration), so
+    the position stays protected even if this process, Railway, or the
+    network dies mid-trade. Cancel-then-place is idempotent, which also
+    makes breakeven/trail updates a clean replace.
     Returns True as long as the software layer is armed."""
     if state is not None:
         state['sl_price'] = float(sl_price)
@@ -526,19 +543,21 @@ def safe_place_sl_or_exit(client, symbol, sl_side, sl_price, position, qty,
     else:
         log.warning(f"{tag} SL: state not passed — SL price NOT persisted")
 
-    try:  # HARD_STOP: clear any stale stop before placing the new one
-        client.futures_cancel_all_open_orders(symbol=symbol)
-    except Exception as e:
-        log.warning(f"{tag} HARD_STOP: pre-place cancel failed: {e}")
+    cancel_symbol_stops(client, symbol, tag)  # clear stale stops first
     try:
-        order = client.futures_create_order(
-            symbol=symbol, side=sl_side, type="STOP_MARKET",
-            stopPrice=sl_price, closePosition="true",
-            workingType="MARK_PRICE")
+        order = client._request_futures_api("post", "algoOrder", True, data={
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": sl_side,
+            "type": "STOP_MARKET",
+            "triggerPrice": sl_price,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+        })
         if state is not None:
-            state['sl_order_id'] = order.get('orderId')
+            state['sl_order_id'] = order.get('algoId')
         log.info(f"{tag} 🛡️ HARD_STOP resting on exchange @ ${sl_price} "
-                 f"(orderId={order.get('orderId')})")
+                 f"(algoId={order.get('algoId')})")
     except Exception as e:
         if state is not None:
             state['sl_order_id'] = None
@@ -1137,10 +1156,7 @@ def process_symbol(symbol, ctx):
                     close_reason="SL_RECONCILE",
                     confidence=state.get('entry_confidence', 0.0),
                     verdict=state.get('entry_verdict', ''))
-                try:  # HARD_STOP: clear leftover orders now that we're flat
-                    exec_client.futures_cancel_all_open_orders(symbol=symbol)
-                except Exception as e:
-                    log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                cancel_symbol_stops(exec_client, symbol, tag)  # HARD_STOP: flat now
                 state['sl_order_id'] = None
                 state['position'] = 0
                 state['entry_price'] = 0.0
@@ -1217,10 +1233,7 @@ def process_symbol(symbol, ctx):
                     # Close the exchange position to resolve ambiguity
                     success, _, _ = emergency_close_position(
                         exec_client, symbol, exchange_side, abs(exchange_qty), tag)
-                    try:  # HARD_STOP: clear leftover orders now that we're flat
-                        exec_client.futures_cancel_all_open_orders(symbol=symbol)
-                    except Exception as e:
-                        log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                    cancel_symbol_stops(exec_client, symbol, tag)  # HARD_STOP: flat now
                     state['sl_order_id'] = None
                     state['position'] = 0
                     state['entry_price'] = 0.0
@@ -1651,10 +1664,7 @@ def process_symbol(symbol, ctx):
                         except Exception as e:
                             log.error(f"{tag} ❌ Memory record failed: {e}")
 
-                    try:  # HARD_STOP: clear the resting stop now that we're flat
-                        exec_client.futures_cancel_all_open_orders(symbol=symbol)
-                    except Exception as e:
-                        log.warning(f"{tag} HARD_STOP cleanup failed: {e}")
+                    cancel_symbol_stops(exec_client, symbol, tag)  # HARD_STOP: flat now
                     state['sl_order_id'] = None
                     state['position'] = 0
                     state['entry_price'] = 0.0
